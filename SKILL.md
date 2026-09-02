@@ -19,6 +19,7 @@ license: MIT
 - 不创建定时任务、后台扫描或系统通知。
 - 授权码不得进入对话、命令行参数、配置文件或日志。
 - 只访问用户已明确加入可信列表的公网 HTTPS 域名；不执行 JavaScript，也不点击网页按钮。
+- 对已知诺诺/JSS、百望预览页，仅调用其页面本身使用的只读详情或 PDF 下载接口；接口返回的新文件域名仍须用户单独加入可信列表。
 
 ## 定位技能目录
 
@@ -188,6 +189,7 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" trust-domain fapiao.example.com --con
 - `PDF_TEXT_EXTRACTION_FAILED`：PDF 文本层异常且布局提取也失败；保留为未完成，不把字段全部静默改为未知。
 - `ARCHIVE_MISSING_SOURCE_UNAVAILABLE`：归档文件已丢失，但旧状态没有邮箱文件夹或 UID，无法自动回补；需用日期范围重扫原邮件。
 - `DOWNLOAD_*`：保留失败项并继续；认证、验证码或动态网页由用户另行处理。
+- `DOWNLOAD_PROVIDER_RESPONSE_*`：已知发票平台的只读接口响应过大、结构异常或未返回 HTTPS PDF；保留待重试并报告，不执行页面脚本兜底。
 
 ## 管理命令
 
