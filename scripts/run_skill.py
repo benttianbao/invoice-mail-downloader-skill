@@ -25,7 +25,8 @@ def main() -> int:
     python = env_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if not python.exists():
         bootstrap = Path(__file__).resolve().parent / "bootstrap.py"
-        raise SystemExit(f'尚未初始化。请先运行：python "{bootstrap}"')
+        launcher = "py -3" if os.name == "nt" else "python3"
+        raise SystemExit(f'尚未初始化。请先运行：{launcher} "{bootstrap}"')
     target = Path(__file__).resolve().parent / "invoice_mail.py"
     return subprocess.run([str(python), str(target), *sys.argv[1:]]).returncode
 
