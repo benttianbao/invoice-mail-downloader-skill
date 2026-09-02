@@ -67,9 +67,32 @@ class InvoiceMailTests(unittest.TestCase):
         self.assertEqual(invoice_mail.invoice_identity(INVOICE_TEXT), "number:12345678901234567890")
         self.assertEqual(invoice_mail.invoice_identity("电子发票 开票日期：2026-09-02", "20260902.pdf"), "")
 
+    def test_invoice_identity_recognizes_dzfp_filename(self) -> None:
+        filename = "dzfp_26932000000718816621_销售方_20260507102101.ofd"
+        self.assertEqual(invoice_mail.invoice_identity("发票号码：", filename), "number:26932000000718816621")
+
     def test_candidate_links_require_context(self) -> None:
         html = '<a href="https://example.com/a">退订</a><a href="https://example.com/b">下载发票</a>'
         self.assertEqual(invoice_mail.extract_candidate_links("", html), ["https://example.com/b"])
+
+    def test_candidate_links_exclude_mailto_and_non_invoice_documents(self) -> None:
+        html = (
+            '<a href="mailto:invoice@example.com">发票邮箱</a>'
+            '<a href="https://example.com/电子发票样式.doc">电子发票样式</a>'
+            '<a href="https://example.com/download/invoice.pdf">下载发票</a>'
+        )
+        self.assertEqual(
+            invoice_mail.extract_candidate_links("", html),
+            ["https://example.com/download/invoice.pdf"],
+        )
+
+    def test_download_links_prefer_pdf_and_ofd_last(self) -> None:
+        links = [
+            "https://example.com/invoice.ofd",
+            "https://example.com/preview?id=1",
+            "https://example.com/invoice.pdf",
+        ]
+        self.assertEqual(invoice_mail.prioritized_download_links(links), [links[2], links[1], links[0]])
 
     def test_redact_url(self) -> None:
         value = invoice_mail.redact_url("https://example.com/download/a.pdf?token=secret#part")
@@ -193,6 +216,40 @@ class InvoiceMailTests(unittest.TestCase):
             self.assertTrue(pdf.exists())
             self.assertFalse(ofd.exists())
             self.assertEqual(state["invoice_formats"]["number:12345678901234567890"], {"pdf": str(pdf)})
+
+    def test_identity_upgrade_removes_dzfp_ofd_when_pdf_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            pdf = root / "invoice.pdf"
+            ofd = root / "invoice.ofd"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            ofd.write_bytes(ofd_bytes())
+            pdf_digest = invoice_mail.sha256_file(pdf)
+            ofd_digest = invoice_mail.sha256_file(ofd)
+            original = "dzfp_26932000000718816621_销售方_20260507102101"
+            state = {
+                "files": {pdf_digest: str(pdf), ofd_digest: str(ofd)},
+                "provenance": {
+                    pdf_digest: {"original_filename": original + ".pdf"},
+                    ofd_digest: {"original_filename": original + ".ofd"},
+                },
+                "invoice_formats": {},
+                "invoice_identity_version": 0,
+            }
+            invoice_mail.rebuild_invoice_identity_index(root, state)
+            self.assertTrue(pdf.exists())
+            self.assertFalse(ofd.exists())
+            self.assertEqual(state["invoice_identity_version"], 2)
+            self.assertEqual(state["invoice_formats"]["number:26932000000718816621"], {"pdf": str(pdf)})
+
+    def test_zip_without_supported_files_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            package = root / "invoice.zip"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("invoice.xml", "<invoice />")
+            result = invoice_mail.process_file(package, package.name, root / "out", {"files": {}}, root)
+            self.assertEqual(result[0][0], "skipped")
 
     def test_missing_archive_requeues_original_uid(self) -> None:
         missing = Path("/tmp/removed-invoice.pdf")
