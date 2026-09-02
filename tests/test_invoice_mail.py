@@ -168,6 +168,32 @@ class InvoiceMailTests(unittest.TestCase):
             self.assertEqual([result[0] for result in results], ["success", "skipped"])
             self.assertEqual([path.suffix for path in (root / "out").rglob("*") if path.is_file()], [".pdf"])
 
+    def test_old_recorded_formats_are_migrated_with_pdf_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            pdf = root / "old.pdf"
+            ofd = root / "old.ofd"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            ofd.write_bytes(ofd_bytes())
+            state = {
+                "files": {
+                    invoice_mail.sha256_file(pdf): str(pdf),
+                    invoice_mail.sha256_file(ofd): str(ofd),
+                },
+                "provenance": {},
+                "invoice_formats": {},
+                "invoice_format_index_built": False,
+            }
+            with (
+                mock.patch.object(invoice_mail, "pdf_text", return_value=INVOICE_TEXT),
+                mock.patch.object(invoice_mail, "ofd_text", return_value=INVOICE_TEXT),
+            ):
+                invoice_mail.rebuild_file_index(root, state)
+            self.assertTrue(state["invoice_format_index_built"])
+            self.assertTrue(pdf.exists())
+            self.assertFalse(ofd.exists())
+            self.assertEqual(state["invoice_formats"]["number:12345678901234567890"], {"pdf": str(pdf)})
+
     def test_message_attachment_is_archived_for_confirmation(self) -> None:
         message = EmailMessage()
         message["Subject"] = "您的电子发票"
