@@ -63,14 +63,33 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 - Python 3.10 或更高版本；
 - macOS 或 Windows；
 - 先在邮箱网页端开启 IMAP 并生成客户端授权码；
-- `configure` 必须由用户本人在本机交互式终端运行；
+- 优先使用一次性本地配置页面，普通用户不需要操作终端；
 - 授权码只保存到 macOS 钥匙串或 Windows 凭据管理器；
-- 首次扫描、修改归档目录和增加可信下载域名都需要用户明确确认。
+- 每个新账号首次运行时，由用户选择邮件日期范围或从现在开始只增量获取；
+- 修改归档目录和增加可信下载域名都需要用户明确确认。
 
 安装隔离依赖：
 
 ```bash
-python "/absolute/path/to/invoice-mail-downloader/scripts/bootstrap.py"
+python3 "/absolute/path/to/invoice-mail-downloader/scripts/bootstrap.py"
+```
+
+初始化后，Agent 可启动本地安全配置页面：
+
+```bash
+python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" configure-ui --provider qq --email user@qq.com
+```
+
+Windows 将 `python3` 替换为 `py -3`。授权码只提交到本机 `127.0.0.1`，在保存前会先验证 TLS 和 IMAP 登录。
+
+首次运行二选一：
+
+```bash
+# 指定邮件接收日期范围
+python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --from-date 2026-08-01 --to-date 2026-08-31 --confirm-first-run
+
+# 不处理历史邮件，从现在开始建立增量游标
+python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --start-from-now --confirm-first-run
 ```
 
 ## 安全边界
@@ -88,4 +107,4 @@ python "/absolute/path/to/invoice-mail-downloader/scripts/bootstrap.py"
 python -m unittest discover -s tests -v
 ```
 
-当前包含 22 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
+当前包含 30 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
