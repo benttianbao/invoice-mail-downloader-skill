@@ -194,6 +194,54 @@ class InvoiceMailTests(unittest.TestCase):
             self.assertFalse(ofd.exists())
             self.assertEqual(state["invoice_formats"]["number:12345678901234567890"], {"pdf": str(pdf)})
 
+    def test_missing_archive_requeues_original_uid(self) -> None:
+        missing = Path("/tmp/removed-invoice.pdf")
+        state = {
+            "files": {"digest": str(missing)},
+            "provenance": {
+                "digest": {
+                    "account": "user@qq.com",
+                    "folder": "收件箱",
+                    "folder_state_key": "user@qq.com::INBOX",
+                    "uid": 42,
+                    "subject": "电子发票",
+                    "sender": "billing@example.com",
+                }
+            },
+            "folders": {
+                "user@qq.com::INBOX": {
+                    "uidvalidity": 1,
+                    "initialized": True,
+                    "last_uid": 100,
+                    "pending_uids": [41],
+                }
+            },
+            "invoice_formats": {"number:1": {"pdf": str(missing)}},
+        }
+        unresolved = invoice_mail.requeue_missing_archives(state)
+        self.assertEqual(unresolved, [])
+        self.assertEqual(state["folders"]["user@qq.com::INBOX"]["pending_uids"], [41, 42])
+        self.assertEqual(state["invoice_formats"]["number:1"], {})
+
+    def test_moved_archive_is_relocated_by_hash_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            moved = root / "moved.pdf"
+            moved.write_bytes(b"%PDF-1.4\n%%EOF")
+            digest = invoice_mail.sha256_file(moved)
+            state = {
+                "files": {digest: str(root / "old" / "invoice.pdf")},
+                "provenance": {digest: {"account": "user@qq.com", "folder_state_key": "user@qq.com::INBOX", "uid": 42}},
+                "folders": {"user@qq.com::INBOX": {"pending_uids": []}},
+                "invoice_formats": {},
+                "invoice_format_index_built": True,
+            }
+            invoice_mail.rebuild_file_index(root, state)
+            unresolved = invoice_mail.requeue_missing_archives(state)
+            self.assertEqual(state["files"][digest], str(moved))
+            self.assertEqual(state["folders"]["user@qq.com::INBOX"]["pending_uids"], [])
+            self.assertEqual(unresolved, [])
+
     def test_message_attachment_is_archived_for_confirmation(self) -> None:
         message = EmailMessage()
         message["Subject"] = "您的电子发票"
@@ -221,6 +269,22 @@ class InvoiceMailTests(unittest.TestCase):
             provenance = next(iter(state["provenance"].values()))
             self.assertEqual(provenance["uid"], 12)
             self.assertEqual(provenance["original_filename"], "invoice.pdf")
+
+    def test_existing_destination_still_records_retry_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "source.pdf"
+            source.write_bytes(b"%PDF-1.4\n%%EOF")
+            archive_root = root / "Invoices"
+            first_state: dict[str, object] = {"files": {}, "provenance": {}}
+            invoice_mail.archive_invoice(source, ".pdf", archive_root, first_state, INVOICE_TEXT)
+            retry_state: dict[str, object] = {"files": {}, "provenance": {}}
+            provenance = {"account": "user@qq.com", "folder_state_key": "user@qq.com::INBOX", "uid": 42}
+            status, _destination, _missing = invoice_mail.archive_invoice(
+                source, ".pdf", archive_root, retry_state, INVOICE_TEXT, provenance
+            )
+            self.assertEqual(status, "skipped")
+            self.assertEqual(next(iter(retry_state["provenance"].values())), provenance)
 
     def test_candidate_without_download_is_incomplete(self) -> None:
         message = EmailMessage()
