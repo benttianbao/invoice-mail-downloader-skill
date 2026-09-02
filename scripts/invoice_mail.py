@@ -34,6 +34,7 @@ from typing import Any, Iterable
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.cookiejar import CookieJar
 import webbrowser
 import zipfile
 
@@ -293,6 +294,8 @@ def extract_candidate_links(plain: str, html: str, message_is_candidate: bool = 
         parts = urllib.parse.urlsplit(url)
         if parts.scheme.lower() not in {"http", "https"}:
             continue
+        if parts.hostname == "fp.nuonuo.com" and parts.path in {"", "/"} and not parts.query:
+            continue
         suffix = Path(parts.path).suffix.lower()
         if suffix and suffix not in SUPPORTED_SUFFIXES:
             continue
@@ -315,6 +318,90 @@ def prioritized_download_links(links: Iterable[str]) -> list[str]:
     priority = {".pdf": 0, ".zip": 1, "": 2, ".ofd": 3}
     unique = list(dict.fromkeys(links))
     return sorted(unique, key=lambda url: priority.get(Path(urllib.parse.urlsplit(url).path).suffix.lower(), 2))
+
+
+def provider_opener(trusted_domains: Iterable[str]) -> Any:
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(CookieJar()),
+        urllib.request.HTTPSHandler(context=tls_context()),
+        SafeRedirectHandler(tuple(trusted_domains)),
+    )
+
+
+def read_limited(response: Any, limit: int) -> bytes:
+    content = response.read(limit + 1)
+    if len(content) > limit:
+        raise SkillError("DOWNLOAD_PROVIDER_RESPONSE_TOO_LARGE", "发票平台接口响应超过安全限制")
+    return content
+
+
+def provider_download_links(page_url: str, trusted_domains: Iterable[str]) -> list[str]:
+    """解析已知发票平台的只读详情接口，不执行网页 JavaScript。"""
+    parts = urllib.parse.urlsplit(page_url)
+    host = (parts.hostname or "").lower()
+    query = urllib.parse.parse_qs(parts.query)
+    if host == "pis.baiwang.com" and parts.path.rstrip("/") == "/smkp-vue/previewInvoiceAllEle":
+        param = query.get("param", [""])[0]
+        if not param:
+            return []
+        return [
+            urllib.parse.urlunsplit(
+                (
+                    "https",
+                    parts.netloc,
+                    "/bwmg/mix/bw/downloadFormat",
+                    urllib.parse.urlencode({"param": param, "formatType": "PDF"}),
+                    "",
+                )
+            )
+        ]
+    if host != "nnfp.jss.com.cn":
+        return []
+
+    trusted = tuple(trusted_domains)
+    validate_public_https(page_url, trusted)
+    opener = provider_opener(trusted)
+    request = urllib.request.Request(page_url, headers={"User-Agent": "invoice-mail-downloader/1.0"})
+    with opener.open(request, timeout=30) as response:
+        final_url = response.geturl()
+        read_limited(response, 2 * 1024 * 1024)
+    final_parts = urllib.parse.urlsplit(final_url)
+    if final_parts.hostname != "nnfp.jss.com.cn" or not final_parts.path.endswith("/printQrcode"):
+        return []
+    final_query = urllib.parse.parse_qs(final_parts.query)
+    param_list = final_query.get("paramList", [""])[0]
+    if not param_list:
+        return []
+    api_url = urllib.parse.urlunsplit(("https", final_parts.netloc, "/scan2/getIvcDetailShow.do", "", ""))
+    payload = urllib.parse.urlencode(
+        {
+            "paramList": param_list,
+            "code": final_query.get("code", [""])[0],
+            "aliView": final_query.get("aliView", [""])[0],
+            "invoiceDetailMiddleUri": final_url,
+            "shortLinkSource": final_query.get("shortLinkSource", [""])[0],
+        }
+    ).encode()
+    api_request = urllib.request.Request(
+        api_url,
+        data=payload,
+        headers={
+            "User-Agent": "invoice-mail-downloader/1.0",
+            "Referer": final_url,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with opener.open(api_request, timeout=30) as response:
+        body = read_limited(response, 2 * 1024 * 1024)
+    try:
+        result = json.loads(body.decode("utf-8"))
+        pdf_url = result["data"]["invoiceSimpleVo"]["url"]
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SkillError("DOWNLOAD_PROVIDER_RESPONSE_INVALID", "诺诺发票详情接口未返回有效 PDF 地址") from exc
+    pdf_parts = urllib.parse.urlsplit(str(pdf_url))
+    if pdf_parts.scheme != "https" or Path(pdf_parts.path).suffix.lower() != ".pdf":
+        raise SkillError("DOWNLOAD_PROVIDER_RESPONSE_INVALID", "诺诺发票详情接口返回的不是 HTTPS PDF 地址")
+    return [str(pdf_url)]
 
 
 def message_content(message: Message) -> tuple[str, str, list[tuple[str, bytes]]]:
@@ -976,11 +1063,13 @@ def process_message(
                 content_type, filename = download_http(url, target, trusted_domains)
                 if content_type in {"text/html", "application/xhtml+xml"} or target.read_bytes()[:256].lstrip().lower().startswith(b"<"):
                     page_html = target.read_text(encoding="utf-8", errors="replace")
-                    page_links = prioritized_download_links([
+                    page_links = provider_download_links(url, trusted_domains)
+                    page_links.extend([
                         urllib.parse.urljoin(url, child)
                         for child in extract_candidate_links("", page_html, True)
                         if urllib.parse.urljoin(url, child) != url
                     ])
+                    page_links = prioritized_download_links(page_links)
                     target.unlink(missing_ok=True)
                     if page_links:
                         for child_index, child_url in enumerate(dict.fromkeys(page_links), start=1):
