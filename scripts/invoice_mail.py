@@ -144,11 +144,15 @@ def load_config() -> dict[str, Any]:
 
 
 def load_state() -> dict[str, Any]:
-    state = load_json(state_path(), {"version": 3, "folders": {}, "files": {}, "provenance": {}})
+    state = load_json(
+        state_path(),
+        {"version": 4, "folders": {}, "files": {}, "provenance": {}, "invoice_formats": {}},
+    )
     state.setdefault("folders", {})
     state.setdefault("files", {})
     state.setdefault("provenance", {})
-    state["version"] = 3
+    state.setdefault("invoice_formats", {})
+    state["version"] = 4
     return state
 
 
@@ -432,10 +436,14 @@ def safe_zip_members(path: Path) -> list[zipfile.ZipInfo]:
     return selected
 
 
-def unpack_zip(path: Path, target: Path) -> list[Path]:
-    output: list[Path] = []
+def unpack_zip(path: Path, target: Path) -> list[tuple[Path, str]]:
+    output: list[tuple[Path, str]] = []
+    members = sorted(
+        safe_zip_members(path),
+        key=lambda info: ({".pdf": 0, ".ofd": 1}.get(PurePosixPath(info.filename).suffix.lower(), 2), info.filename),
+    )
     with zipfile.ZipFile(path) as archive:
-        for index, info in enumerate(safe_zip_members(path), start=1):
+        for index, info in enumerate(members, start=1):
             suffix = PurePosixPath(info.filename).suffix.lower()
             destination = target / f"item-{index}{suffix}"
             with archive.open(info) as source, destination.open("wb") as sink:
@@ -446,7 +454,7 @@ def unpack_zip(path: Path, target: Path) -> list[Path]:
                     corrected = destination.with_suffix(actual)
                     destination.rename(corrected)
                     destination = corrected
-                output.append(destination)
+                output.append((destination, info.filename))
             else:
                 destination.unlink(missing_ok=True)
     return output
@@ -568,6 +576,25 @@ def extract_invoice_fields(text: str) -> dict[str, str]:
     return {"date": date_value, "seller": seller, "amount": amount}
 
 
+def invoice_identity(text: str, filename: str = "") -> str:
+    """提取可用于跨格式去重的可靠票号；无法可靠识别时返回空字符串。"""
+    flat = normalize_text(text)
+    patterns = (
+        r"发票号码?\s*[：:]?\s*([0-9][0-9\s]{6,30}[0-9])",
+        r"(?:电子)?客票(?:号码?|号)\s*[：:]?\s*([0-9][0-9\s]{6,30}[0-9])",
+    )
+    for pattern in patterns:
+        if match := re.search(pattern, flat, re.I):
+            number = re.sub(r"\s+", "", match.group(1))
+            if 8 <= len(number) <= 30:
+                return f"number:{number}"
+
+    # 仅当文件名明确标注票号时才降级使用文件名，避免把日期误当发票号码。
+    if match := re.search(r"(?:发票|票号|invoice)[^0-9]{0,12}([0-9]{8,30})", filename, re.I):
+        return f"number:{match.group(1)}"
+    return ""
+
+
 def is_invoice_document(text: str, filename: str = "") -> bool:
     flat = normalize_text(text)
     lowered_name = filename.lower()
@@ -646,6 +673,38 @@ def archive_invoice(
     if provenance:
         state.setdefault("provenance", {})[digest] = provenance
     return "success", str(destination), missing
+
+
+def recorded_format_path(state: dict[str, Any], invoice_key: str, suffix: str) -> Path | None:
+    value = state.setdefault("invoice_formats", {}).get(invoice_key, {}).get(suffix.lstrip("."))
+    if not value:
+        return None
+    path = Path(value)
+    if path.exists():
+        return path
+    state["invoice_formats"][invoice_key].pop(suffix.lstrip("."), None)
+    return None
+
+
+def remove_recorded_ofd(state: dict[str, Any], invoice_key: str, root: Path) -> str:
+    """PDF 成功归档后，仅删除本技能状态中记录且位于归档根目录内的同票号 OFD。"""
+    ofd_path = recorded_format_path(state, invoice_key, ".ofd")
+    if ofd_path is None:
+        return ""
+    try:
+        resolved = ofd_path.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return ""
+    if resolved.suffix.lower() != ".ofd":
+        return ""
+    resolved.unlink(missing_ok=True)
+    removed_digests = [digest for digest, value in state.setdefault("files", {}).items() if Path(value) == ofd_path]
+    for digest in removed_digests:
+        state["files"].pop(digest, None)
+        state.setdefault("provenance", {}).pop(digest, None)
+    state["invoice_formats"][invoice_key].pop("ofd", None)
+    return str(ofd_path)
 
 
 def decode_modified_utf7(value: str) -> str:
@@ -782,7 +841,10 @@ def process_file(
     state: dict[str, Any],
     temp_dir: Path,
     provenance: dict[str, Any] | None = None,
+    seen_pdf_keys: set[str] | None = None,
 ) -> list[tuple[str, str, str]]:
+    if seen_pdf_keys is None:
+        seen_pdf_keys = set()
     if path.stat().st_size > MAX_FILE_BYTES:
         return [("incomplete", hinted_name, "文件超过 50 MB 限制")]
     suffix = detect_file_type(path, hinted_name)
@@ -796,10 +858,12 @@ def process_file(
         if not extracted:
             return [("incomplete", hinted_name, "ZIP 中没有有效 PDF/OFD")]
         results: list[tuple[str, str, str]] = []
-        for extracted_file in extracted:
+        for extracted_file, member_name in extracted:
             child_provenance = dict(provenance or {})
-            child_provenance.update({"container": hinted_name, "member": extracted_file.name})
-            results.extend(process_file(extracted_file, extracted_file.name, root, state, temp_dir, child_provenance))
+            child_provenance.update({"container": hinted_name, "member": member_name})
+            results.extend(
+                process_file(extracted_file, member_name, root, state, temp_dir, child_provenance, seen_pdf_keys)
+            )
         return results
     try:
         text = pdf_text(path) if suffix == ".pdf" else ofd_text(path)
@@ -807,10 +871,25 @@ def process_file(
         return [("incomplete", hinted_name, str(exc))]
     if not is_invoice_document(text, hinted_name):
         return [("skipped", hinted_name, "附件内容不是可识别的发票，未归档")]
+    invoice_key = invoice_identity(text, hinted_name)
+    if suffix == ".ofd" and invoice_key:
+        existing_pdf = recorded_format_path(state, invoice_key, ".pdf")
+        if invoice_key in seen_pdf_keys or existing_pdf is not None:
+            detail = str(existing_pdf) if existing_pdf is not None else "本批次已处理同一发票的 PDF"
+            return [("skipped", hinted_name, f"同一发票已有 PDF，未保留 OFD；{detail}")]
     status, destination, missing = archive_invoice(path, suffix, root, state, text, provenance)
+    removed_ofd = ""
+    if invoice_key:
+        formats = state.setdefault("invoice_formats", {}).setdefault(invoice_key, {})
+        formats[suffix.lstrip(".")] = destination
+        if suffix == ".pdf":
+            seen_pdf_keys.add(invoice_key)
+            removed_ofd = remove_recorded_ofd(state, invoice_key, root)
     detail = destination
     if missing:
         detail += "；待确认字段：" + "、".join(missing)
+    if removed_ofd:
+        detail += f"；已移除同一发票的 OFD：{removed_ofd}"
     return [(status, hinted_name, detail)]
 
 
@@ -833,9 +912,14 @@ def process_message(
         return [], False
 
     items: list[dict[str, str]] = []
+    seen_pdf_keys: set[str] = set()
     with tempfile.TemporaryDirectory(dir=temp_dir) as message_tmp_name:
         message_tmp = Path(message_tmp_name)
-        for index, (filename, payload) in enumerate(attachments, start=1):
+        prioritized_attachments = sorted(
+            enumerate(attachments, start=1),
+            key=lambda item: ({".pdf": 0, ".zip": 1, ".ofd": 2}.get(Path(item[1][0]).suffix.lower(), 3), item[0]),
+        )
+        for index, (filename, payload) in prioritized_attachments:
             suffix = Path(filename).suffix.lower()
             if suffix not in SUPPORTED_SUFFIXES:
                 continue
@@ -854,7 +938,9 @@ def process_message(
                     "original_filename": filename,
                 }
             )
-            for status, source, detail in process_file(attachment_path, filename, root, state, message_tmp, provenance):
+            for status, source, detail in process_file(
+                attachment_path, filename, root, state, message_tmp, provenance, seen_pdf_keys
+            ):
                 items.append(report_item(status, f"附件:{source}", subject, sender, detail))
 
         links = extract_candidate_links(plain, html, candidate)
@@ -890,7 +976,7 @@ def process_message(
                                     }
                                 )
                                 for status, _source, detail in process_file(
-                                    child_target, child_name, root, state, message_tmp, provenance
+                                    child_target, child_name, root, state, message_tmp, provenance, seen_pdf_keys
                                 ):
                                     items.append(report_item(status, child_source, subject, sender, detail))
                             except Exception as exc:
@@ -907,7 +993,9 @@ def process_message(
                         "source_url": redacted,
                     }
                 )
-                for status, _source, detail in process_file(target, filename, root, state, message_tmp, provenance):
+                for status, _source, detail in process_file(
+                    target, filename, root, state, message_tmp, provenance, seen_pdf_keys
+                ):
                     items.append(report_item(status, redacted, subject, sender, detail))
             except Exception as exc:
                 items.append(report_item("incomplete", redacted, subject, sender, str(exc), error_code(exc, "DOWNLOAD_FAILED")))
