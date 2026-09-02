@@ -674,6 +674,8 @@ def archive_invoice(
     if destination.exists():
         if sha256_file(destination) == digest:
             state["files"][digest] = str(destination)
+            if provenance:
+                state.setdefault("provenance", {})[digest] = provenance
             return "skipped", str(destination), missing
         destination = destination.with_name(f"{destination.stem}_{digest[:8]}{suffix}")
     shutil.copy2(source, destination)
@@ -1160,7 +1162,7 @@ def run_account_once(
                         state,
                         temp_dir,
                         trusted_domains,
-                        {"account": email, "folder": display_name, "uid": uid},
+                        {"account": email, "folder": display_name, "folder_state_key": key, "uid": uid},
                     )
                     output.extend(items)
                     if incomplete:
@@ -1549,7 +1551,10 @@ def rebuild_file_index(root: Path, state: dict[str, Any]) -> None:
         return
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() in {".pdf", ".ofd"}:
-            files.setdefault(sha256_file(path), str(path))
+            digest = sha256_file(path)
+            recorded = files.get(digest)
+            if not recorded or not Path(recorded).exists():
+                files[digest] = str(path)
     if state.get("invoice_format_index_built"):
         return
 
@@ -1568,6 +1573,61 @@ def rebuild_file_index(root: Path, state: dict[str, Any]) -> None:
         if formats.get("pdf") and formats.get("ofd"):
             remove_recorded_ofd(state, invoice_key, root)
     state["invoice_format_index_built"] = True
+
+
+def folder_state_key_from_provenance(state: dict[str, Any], provenance: dict[str, Any]) -> str:
+    explicit = str(provenance.get("folder_state_key", ""))
+    if explicit in state.setdefault("folders", {}):
+        return explicit
+    account = str(provenance.get("account", "")).lower()
+    display_name = str(provenance.get("folder", ""))
+    prefix = f"{account}::"
+    for key in state["folders"]:
+        if not key.startswith(prefix):
+            continue
+        wire_name = key[len(prefix) :].strip('"')
+        if wire_name == display_name or decode_modified_utf7(wire_name) == display_name:
+            return key
+    return ""
+
+
+def requeue_missing_archives(state: dict[str, Any]) -> list[dict[str, str]]:
+    """把已登记但已丢失的归档文件对应邮件重新放入增量待处理队列。"""
+    unresolved: list[dict[str, str]] = []
+    missing_paths = {
+        digest: Path(value)
+        for digest, value in state.setdefault("files", {}).items()
+        if not Path(value).exists()
+    }
+    for digest, missing_path in missing_paths.items():
+        for formats in state.setdefault("invoice_formats", {}).values():
+            for format_name, value in list(formats.items()):
+                if Path(value) == missing_path:
+                    formats.pop(format_name, None)
+        provenance = state.setdefault("provenance", {}).get(digest, {})
+        uid_value = provenance.get("uid")
+        key = folder_state_key_from_provenance(state, provenance)
+        try:
+            uid = int(uid_value)
+        except (TypeError, ValueError):
+            uid = 0
+        if key and uid > 0:
+            folder_state = state["folders"][key]
+            pending = {int(value) for value in folder_state.get("pending_uids", [])}
+            pending.add(uid)
+            folder_state["pending_uids"] = sorted(pending)
+            continue
+        unresolved.append(
+            report_item(
+                "incomplete",
+                f"归档:{missing_path.name}",
+                str(provenance.get("subject", "")),
+                str(provenance.get("sender", "")),
+                "已登记的归档文件不存在，且旧状态缺少可重试的邮箱文件夹或 UID",
+                "ARCHIVE_MISSING_SOURCE_UNAVAILABLE",
+            )
+        )
+    return unresolved
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1610,7 +1670,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         atomic_json_write(config_path(), config)
     state = load_state()
     rebuild_file_index(root, state)
-    results: list[dict[str, str]] = []
+    results = requeue_missing_archives(state)
     with exclusive_run_lock(), tempfile.TemporaryDirectory(prefix="invoice-mail-") as temp_name:
         temp_dir = Path(temp_name)
         for account in accounts:
