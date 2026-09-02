@@ -1,6 +1,6 @@
 # Invoice Mail Downloader Skill
 
-一个跨 Codex、WorkBuddy 等支持 `SKILL.md` 的 AI Agent Skill：从已配置的 163 邮箱或 QQ 邮箱中按需查找电子发票附件和可信下载链接，下载 PDF/OFD、解包 ZIP，并按日期命名归档。
+一个跨 Codex、WorkBuddy 等支持 `SKILL.md` 的 AI Agent Skill：从已配置的 163 邮箱或 QQ 邮箱中按需查找电子发票附件和可信下载链接，下载 PDF/OFD、解包 ZIP，并按日期命名归档。同一发票优先保留 PDF，只有没有 PDF 时才保留 OFD。
 
 ## 安装
 
@@ -66,6 +66,7 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 - 优先使用一次性本地配置页面，普通用户不需要操作终端；
 - 授权码只保存到 macOS 钥匙串或 Windows 凭据管理器；
 - 每个新账号首次运行时，由用户选择邮件日期范围或从现在开始只增量获取；
+- 同一票号同时提供 PDF/OFD 时仅保留 PDF，ZIP 内也应用相同规则；
 - 修改归档目录和增加可信下载域名都需要用户明确确认。
 
 安装隔离依赖：
@@ -107,4 +108,4 @@ python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --s
 python -m unittest discover -s tests -v
 ```
 
-当前包含 30 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
+当前包含 34 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
