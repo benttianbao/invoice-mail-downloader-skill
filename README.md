@@ -69,6 +69,7 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 - 同一票号同时提供 PDF/OFD 时仅保留 PDF，ZIP 内也应用相同规则；
 - 已登记文件被删除后会自动回补原邮件；只在归档根目录内移动则按哈希更新路径，不重复下载；
 - 识别常见 `dzfp_票号` 文件名，过滤邮件地址和 DOC/DOCX 说明链接，避免冗余 OFD及无效重试；
+- 支持通过诺诺/JSS、百望预览页使用的只读官方接口解析 PDF，同时继续要求最终文件域名逐个获得信任；
 - 修改归档目录和增加可信下载域名都需要用户明确确认。
 
 安装隔离依赖：
@@ -110,4 +111,4 @@ python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --s
 python -m unittest discover -s tests -v
 ```
 
-当前包含 43 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
+当前包含 46 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
