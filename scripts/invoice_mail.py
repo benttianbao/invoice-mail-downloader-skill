@@ -14,13 +14,16 @@ from email.parser import BytesParser
 from email.utils import parseaddr
 import getpass
 import hashlib
+import html as html_module
 from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import imaplib
 import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import socket
 import ssl
@@ -31,6 +34,7 @@ from typing import Any, Iterable
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 import zipfile
 
 
@@ -40,14 +44,28 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_ZIP_BYTES = 200 * 1024 * 1024
 MAX_ZIP_FILES = 100
 MAX_COMPRESSION_RATIO = 200
+MAX_MESSAGE_BYTES = 70 * 1024 * 1024
+IMAP_TIMEOUT_SECONDS = 20
 KEYWORDS = ("发票", "电子票", "开票", "票据", "invoice", "e-invoice", "einvoice")
 SUPPORTED_SUFFIXES = {".pdf", ".ofd", ".zip"}
 PROVIDERS = {
     "163": {"domain": "163.com", "imap": "imap.163.com", "port": 993},
     "qq": {"domain": "qq.com", "imap": "imap.qq.com", "port": 993},
 }
-EXCLUDED_FLAGS = {b"\\Sent", b"\\Drafts", b"\\Trash", b"\\Junk"}
-EXCLUDED_NAMES = ("sent", "draft", "trash", "junk", "spam", "已发送", "草稿", "垃圾")
+EXCLUDED_FLAGS = {b"\\Sent", b"\\Drafts", b"\\Trash", b"\\Junk", b"\\Noselect"}
+EXCLUDED_NAMES = (
+    "sent",
+    "draft",
+    "trash",
+    "junk",
+    "spam",
+    "deleted messages",
+    "deleted",
+    "已发送",
+    "草稿",
+    "垃圾",
+    "已删除",
+)
 
 
 class SkillError(RuntimeError):
@@ -109,39 +127,84 @@ def state_path() -> Path:
 
 def load_config() -> dict[str, Any]:
     defaults = {
-        "version": 2,
+        "version": 3,
         "invoice_root": str(default_invoice_root()),
-        "initial_lookback_days": 30,
-        "first_run_confirmed": False,
         "trusted_domains": [],
         "accounts": [],
     }
     config = load_json(config_path(), defaults.copy())
     for key, value in defaults.items():
         config.setdefault(key, value)
-    config["version"] = 2
+    legacy_confirmed = bool(config.pop("first_run_confirmed", False))
+    config.pop("initial_lookback_days", None)
+    for account in config.get("accounts", []):
+        account.setdefault("scan_confirmed", legacy_confirmed)
+    config["version"] = 3
     return config
 
 
 def load_state() -> dict[str, Any]:
-    return load_json(state_path(), {"version": 2, "folders": {}, "files": {}})
+    state = load_json(state_path(), {"version": 3, "folders": {}, "files": {}, "provenance": {}})
+    state.setdefault("folders", {})
+    state.setdefault("files", {})
+    state.setdefault("provenance", {})
+    state["version"] = 3
+    return state
+
+
+def pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 @contextlib.contextmanager
 def exclusive_run_lock() -> Iterable[None]:
     lock = app_data_dir() / "run.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError as exc:
+            try:
+                existing = json.loads(lock.read_text(encoding="utf-8"))
+                existing_pid = int(existing.get("pid", 0))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                existing_pid = 0
+            if pid_is_running(existing_pid):
+                raise SkillError("RUN_LOCKED", f"已有扫描正在运行（PID {existing_pid}）：{lock}") from exc
+            with contextlib.suppress(FileNotFoundError):
+                lock.unlink()
+    else:
+        raise SkillError("RUN_LOCKED", f"无法取得运行锁：{lock}")
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        raise SkillError("RUN_LOCKED", f"已有扫描正在运行；确认前次异常退出后才能删除精确锁文件：{lock}") from exc
-    try:
-        os.write(fd, str(os.getpid()).encode("ascii"))
+        lock_value = json.dumps({"pid": os.getpid(), "created_at": dt.datetime.now().astimezone().isoformat()})
+        os.write(fd, lock_value.encode("utf-8"))
         os.close(fd)
         yield
     finally:
         with contextlib.suppress(FileNotFoundError):
             lock.unlink()
+
+
+def tls_context() -> ssl.SSLContext:
+    import certifi
+
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def emit_progress(event: str, **values: Any) -> None:
+    safe = {"event": event, **values}
+    print(json.dumps(safe, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
 def credential_set(email: str, secret: str) -> None:
@@ -295,7 +358,7 @@ def download_http(url: str, destination: Path, trusted_domains: Iterable[str]) -
     trusted = tuple(trusted_domains)
     validate_public_https(url, trusted)
     opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        urllib.request.HTTPSHandler(context=tls_context()),
         SafeRedirectHandler(trusted),
     )
     request = urllib.request.Request(url, headers={"User-Agent": "invoice-mail-downloader/1.0"})
@@ -390,13 +453,34 @@ def unpack_zip(path: Path, target: Path) -> list[Path]:
 
 
 def pdf_text(path: Path) -> str:
-    from pypdf import PdfReader
+    texts: list[str] = []
+    errors: list[Exception] = []
+    try:
+        import pdfplumber
 
-    reader = PdfReader(str(path), strict=False)
-    if reader.is_encrypted:
-        with contextlib.suppress(Exception):
-            reader.decrypt("")
-    return "\n".join(page.extract_text() or "" for page in reader.pages[:5])
+        with pdfplumber.open(path) as document:
+            layout = "\n".join(
+                page.extract_text(layout=True, x_tolerance=2, y_tolerance=3) or "" for page in document.pages[:5]
+            )
+        if layout.strip():
+            texts.append(layout)
+    except Exception as exc:
+        errors.append(exc)
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path), strict=False)
+        if reader.is_encrypted:
+            with contextlib.suppress(Exception):
+                reader.decrypt("")
+        plain = "\n".join(page.extract_text() or "" for page in reader.pages[:5])
+        if plain.strip() and plain not in texts:
+            texts.append(plain)
+    except Exception as exc:
+        errors.append(exc)
+    if texts:
+        return "\n".join(texts)
+    raise SkillError("PDF_TEXT_EXTRACTION_FAILED", f"PDF 文字提取失败：{type(errors[-1]).__name__ if errors else 'UnknownError'}")
 
 
 def ofd_text(path: Path) -> str:
@@ -430,6 +514,16 @@ def extract_invoice_fields(text: str) -> dict[str, str]:
             except ValueError:
                 continue
 
+    if not date_value and "开票日期" in flat:
+        tail = flat.split("开票日期", 1)[1][:800]
+        if match := re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", tail):
+            with contextlib.suppress(ValueError):
+                date_value = dt.date(*map(int, match.groups())).isoformat()
+    if not date_value and "开票日期" in flat:
+        if match := re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", flat):
+            with contextlib.suppress(ValueError):
+                date_value = dt.date(*map(int, match.groups())).isoformat()
+
     seller_patterns = (
         r"销售方(?:信息)?\s*(?:名称)?\s*[：:]?\s*([^：:]{2,80}?)(?=\s*(?:统一社会信用代码|纳税人识别号|地址|开户行|购买方|发票))",
         r"销方名称\s*[：:]?\s*([^：:]{2,80}?)(?=\s*(?:统一社会信用代码|纳税人识别号|地址|开户行|$))",
@@ -439,15 +533,62 @@ def extract_invoice_fields(text: str) -> dict[str, str]:
             seller = normalize_text(match.group(1))
             break
 
+    if not seller:
+        for line in text.splitlines():
+            names = [normalize_text(value) for value in re.findall(r"名称\s*[：:]\s*(.*?)(?=\s+名称\s*[：:]|$)", line)]
+            names = [value for value in names if len(value) >= 2]
+            if len(names) >= 2:
+                seller = names[-1]
+                break
+    if not seller and "铁路电子客票" in flat:
+        seller = "中国铁路"
+    if not seller and re.search(r"销\s*售\s*方", flat):
+        identity_pattern = r"20\d{2}年\d{1,2}月\d{1,2}日\s+(.{2,80}?)\s+[0-9A-Z]{15,20}\s+(.{2,100}?)\s+[0-9A-Z]{15,20}"
+        if match := re.search(identity_pattern, flat):
+            seller = normalize_text(match.group(2))
+
     amount_patterns = (
+        r"价税合计[^\n]{0,160}?[（(]小写[)）]\s*[¥￥]?\s*([0-9][0-9,]*\.\d{2})",
         r"价税合计.{0,40}?(?:小写)?\s*[（(]?(?:小写)?[)）]?\s*[：:]?\s*[¥￥]?\s*([0-9][0-9,]*\.\d{2})",
         r"[（(]小写[)）]\s*[¥￥]?\s*([0-9][0-9,]*\.\d{2})",
+        r"(?:票价|退票费)\s*[：:]?\s*[¥￥]?\s*([0-9][0-9,]*\.\d{2})",
     )
     for pattern in amount_patterns:
         if match := re.search(pattern, flat, re.I):
             amount = match.group(1).replace(",", "")
             break
+    if not amount and "铁路电子客票" in flat:
+        railway_amounts = re.findall(r"[¥￥]\s*([0-9][0-9,]*\.\d{2})", flat)
+        if railway_amounts:
+            amount = railway_amounts[-1].replace(",", "")
+    if not amount and "价税合计" in flat:
+        totals = re.findall(r"[¥￥]\s*([0-9][0-9,]*\.\d{2})", flat)
+        if totals:
+            amount = totals[-1].replace(",", "")
     return {"date": date_value, "seller": seller, "amount": amount}
+
+
+def is_invoice_document(text: str, filename: str = "") -> bool:
+    flat = normalize_text(text)
+    lowered_name = filename.lower()
+    excluded_titles = ("境外汇款申请书", "application for funds transfers", "借款合同", "劳动合同")
+    if any(value in flat.lower() for value in excluded_titles):
+        return False
+    strong_titles = ("电子发票", "数电发票", "增值税发票", "铁路电子客票", "航空运输电子客票")
+    if any(value in flat for value in strong_titles):
+        return True
+    if has_invoice_keyword(lowered_name):
+        return True
+    signals = sum(
+        bool(re.search(pattern, flat, re.I))
+        for pattern in (
+            r"发票号码?\s*[：:]?\s*\d{8,}",
+            r"开票日期\s*[：:]?",
+            r"价税合计|[（(]小写[)）]",
+            r"销售方(?:信息)?|销方名称",
+        )
+    )
+    return signals >= 3
 
 
 def safe_component(value: str, fallback: str, limit: int = 60) -> str:
@@ -464,12 +605,17 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def archive_invoice(source: Path, suffix: str, root: Path, state: dict[str, Any]) -> tuple[str, str, list[str]]:
-    try:
+def archive_invoice(
+    source: Path,
+    suffix: str,
+    root: Path,
+    state: dict[str, Any],
+    text: str | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> tuple[str, str, list[str]]:
+    if text is None:
         text = pdf_text(source) if suffix == ".pdf" else ofd_text(source)
-        fields = extract_invoice_fields(text)
-    except Exception:
-        fields = {"date": "", "seller": "", "amount": ""}
+    fields = extract_invoice_fields(text)
     missing = [key for key in ("date", "seller", "amount") if not fields[key]]
     date_label = fields["date"] or "未知日期"
     seller_label = safe_component(fields["seller"], "未知销售方")
@@ -479,6 +625,8 @@ def archive_invoice(source: Path, suffix: str, root: Path, state: dict[str, Any]
     digest = sha256_file(source)
     existing = state.setdefault("files", {}).get(digest)
     if existing and Path(existing).exists():
+        if provenance:
+            state.setdefault("provenance", {})[digest] = provenance
         return "skipped", existing, missing
 
     if missing:
@@ -495,6 +643,8 @@ def archive_invoice(source: Path, suffix: str, root: Path, state: dict[str, Any]
         destination = destination.with_name(f"{destination.stem}_{digest[:8]}{suffix}")
     shutil.copy2(source, destination)
     state["files"][digest] = str(destination)
+    if provenance:
+        state.setdefault("provenance", {})[digest] = provenance
     return "success", str(destination), missing
 
 
@@ -575,6 +725,21 @@ def response_number(client: imaplib.IMAP4_SSL, name: str) -> int | None:
     return None
 
 
+def folder_uidvalidity(client: imaplib.IMAP4_SSL, wire_name: str) -> int | None:
+    value = response_number(client, "UIDVALIDITY")
+    if value is not None:
+        return value
+    try:
+        status, values = client.status(wire_name, "(UIDVALIDITY)")
+    except imaplib.IMAP4.error:
+        return None
+    if status == "OK":
+        for item in values or []:
+            if isinstance(item, bytes) and (match := re.search(rb"UIDVALIDITY\s+(\d+)", item, re.I)):
+                return int(match.group(1))
+    return None
+
+
 def current_last_uid(client: imaplib.IMAP4_SSL) -> int:
     uid_next = response_number(client, "UIDNEXT")
     if uid_next is not None:
@@ -616,6 +781,7 @@ def process_file(
     root: Path,
     state: dict[str, Any],
     temp_dir: Path,
+    provenance: dict[str, Any] | None = None,
 ) -> list[tuple[str, str, str]]:
     if path.stat().st_size > MAX_FILE_BYTES:
         return [("incomplete", hinted_name, "文件超过 50 MB 限制")]
@@ -631,9 +797,17 @@ def process_file(
             return [("incomplete", hinted_name, "ZIP 中没有有效 PDF/OFD")]
         results: list[tuple[str, str, str]] = []
         for extracted_file in extracted:
-            results.extend(process_file(extracted_file, extracted_file.name, root, state, temp_dir))
+            child_provenance = dict(provenance or {})
+            child_provenance.update({"container": hinted_name, "member": extracted_file.name})
+            results.extend(process_file(extracted_file, extracted_file.name, root, state, temp_dir, child_provenance))
         return results
-    status, destination, missing = archive_invoice(path, suffix, root, state)
+    try:
+        text = pdf_text(path) if suffix == ".pdf" else ofd_text(path)
+    except Exception as exc:
+        return [("incomplete", hinted_name, str(exc))]
+    if not is_invoice_document(text, hinted_name):
+        return [("skipped", hinted_name, "附件内容不是可识别的发票，未归档")]
+    status, destination, missing = archive_invoice(path, suffix, root, state, text, provenance)
     detail = destination
     if missing:
         detail += "；待确认字段：" + "、".join(missing)
@@ -646,10 +820,12 @@ def process_message(
     state: dict[str, Any],
     temp_dir: Path,
     trusted_domains: Iterable[str] = (),
+    provenance_base: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, str]], bool]:
     message = BytesParser(policy=policy.default).parsebytes(raw)
     subject = decode_mime(message.get("Subject"))
     sender = parseaddr(decode_mime(message.get("From")))[1]
+    message_date = decode_mime(message.get("Date"))
     plain, html, attachments = message_content(message)
     candidate = has_invoice_keyword(" ".join((subject, plain, re.sub(r"<[^>]+>", " ", html))))
     candidate = candidate or any(has_invoice_keyword(name) for name, _ in attachments)
@@ -668,7 +844,17 @@ def process_message(
                 continue
             attachment_path = message_tmp / f"attachment-{index}{suffix}"
             attachment_path.write_bytes(payload)
-            for status, source, detail in process_file(attachment_path, filename, root, state, message_tmp):
+            provenance = dict(provenance_base or {})
+            provenance.update(
+                {
+                    "message_date": message_date,
+                    "subject": subject,
+                    "sender": sender,
+                    "source_type": "attachment",
+                    "original_filename": filename,
+                }
+            )
+            for status, source, detail in process_file(attachment_path, filename, root, state, message_tmp, provenance):
                 items.append(report_item(status, f"附件:{source}", subject, sender, detail))
 
         links = extract_candidate_links(plain, html, candidate)
@@ -693,13 +879,35 @@ def process_message(
                                 child_type, child_name = download_http(child_url, child_target, trusted_domains)
                                 if child_type in {"text/html", "application/xhtml+xml"}:
                                     raise SkillError("DOWNLOAD_DYNAMIC_PAGE", "下载链接仍返回网页；脚本不会执行 JavaScript 或点击按钮")
-                                for status, _source, detail in process_file(child_target, child_name, root, state, message_tmp):
+                                provenance = dict(provenance_base or {})
+                                provenance.update(
+                                    {
+                                        "message_date": message_date,
+                                        "subject": subject,
+                                        "sender": sender,
+                                        "source_type": "link",
+                                        "source_url": child_source,
+                                    }
+                                )
+                                for status, _source, detail in process_file(
+                                    child_target, child_name, root, state, message_tmp, provenance
+                                ):
                                     items.append(report_item(status, child_source, subject, sender, detail))
                             except Exception as exc:
                                 items.append(report_item("incomplete", child_source, subject, sender, str(exc), error_code(exc, "DOWNLOAD_FAILED")))
                         continue
                     raise SkillError("DOWNLOAD_DYNAMIC_PAGE", "页面没有静态发票文件链接；脚本不会执行 JavaScript 或点击按钮")
-                for status, _source, detail in process_file(target, filename, root, state, message_tmp):
+                provenance = dict(provenance_base or {})
+                provenance.update(
+                    {
+                        "message_date": message_date,
+                        "subject": subject,
+                        "sender": sender,
+                        "source_type": "link",
+                        "source_url": redacted,
+                    }
+                )
+                for status, _source, detail in process_file(target, filename, root, state, message_tmp, provenance):
                     items.append(report_item(status, redacted, subject, sender, detail))
             except Exception as exc:
                 items.append(report_item("incomplete", redacted, subject, sender, str(exc), error_code(exc, "DOWNLOAD_FAILED")))
@@ -719,6 +927,13 @@ def process_message(
 
 
 def fetch_message(client: imaplib.IMAP4_SSL, uid: int) -> bytes:
+    status, metadata = client.uid("fetch", str(uid), "(RFC822.SIZE)")
+    if status != "OK":
+        raise RuntimeError("无法读取邮件大小")
+    joined = b" ".join(value for value in metadata or [] if isinstance(value, bytes))
+    if match := re.search(rb"RFC822\.SIZE\s+(\d+)", joined, re.I):
+        if int(match.group(1)) > MAX_MESSAGE_BYTES:
+            raise SkillError("MESSAGE_TOO_LARGE", "邮件超过 70 MB 安全限制，已保留待重试状态")
     status, values = client.uid("fetch", str(uid), "(BODY.PEEK[])")
     if status != "OK":
         raise RuntimeError("邮件读取失败")
@@ -738,17 +953,26 @@ def run_account_once(
     temp_dir: Path,
     explicit_range: bool,
     trusted_domains: Iterable[str],
+    start_from_now: bool = False,
+    state_saver: Any | None = None,
 ) -> list[dict[str, str]]:
     email = account["email"]
     provider_name = account["provider"]
     provider = PROVIDERS[provider_name]
     output: list[dict[str, str]] = []
-    context = ssl.create_default_context()
-    with imaplib.IMAP4_SSL(provider["imap"], provider["port"], ssl_context=context, timeout=30) as client:
+    context = tls_context()
+    with imaplib.IMAP4_SSL(
+        provider["imap"], provider["port"], ssl_context=context, timeout=IMAP_TIMEOUT_SECONDS
+    ) as client:
         client.login(email, secret)
         send_imap_identity(client, provider_name)
         for wire_name, display_name in folder_entries(client):
-            status, select_response = client.select(wire_name, readonly=True)
+            emit_progress("folder_start", account=email, folder=display_name)
+            try:
+                status, select_response = client.select(wire_name, readonly=True)
+            except imaplib.IMAP4.error as exc:
+                output.append(report_item("error", f"文件夹:{display_name}", "", email, str(exc), "FOLDER_SELECT_FAILED"))
+                continue
             if status != "OK":
                 response_text = " ".join(
                     value.decode("utf-8", errors="replace") for value in select_response or [] if isinstance(value, bytes)
@@ -771,7 +995,7 @@ def run_account_once(
                 key,
                 {"uidvalidity": None, "initialized": False, "last_uid": 0, "pending_uids": []},
             )
-            uidvalidity = response_number(client, "UIDVALIDITY")
+            uidvalidity = folder_uidvalidity(client, wire_name)
             if uidvalidity is None:
                 output.append(
                     report_item("error", f"文件夹:{display_name}", "", email, "服务器未返回 UIDVALIDITY", "UIDVALIDITY_MISSING")
@@ -783,18 +1007,31 @@ def run_account_once(
 
             previous_pending = {int(value) for value in folder_state.get("pending_uids", [])}
             last_uid = int(folder_state.get("last_uid", 0))
+            initialize_from_range = False
             try:
+                if start_from_now:
+                    checkpoint = current_last_uid(client)
+                    folder_state.update(
+                        {"uidvalidity": uidvalidity, "initialized": True, "last_uid": checkpoint, "pending_uids": []}
+                    )
+                    if state_saver:
+                        state_saver()
+                    emit_progress("folder_initialized", account=email, folder=display_name, last_uid=checkpoint)
+                    continue
                 if explicit_range:
                     uids = search_date_uids(client, from_date, to_date)
-                    pending = set(previous_pending)
-                    checkpoint = last_uid
+                    pending = set(previous_pending) | set(uids)
+                    if folder_state.get("initialized", False):
+                        checkpoint = last_uid
+                    else:
+                        checkpoint = current_last_uid(client)
+                        uids = [uid for uid in uids if uid <= checkpoint]
+                        initialize_from_range = True
                 elif not folder_state.get("initialized", False):
-                    checkpoint = current_last_uid(client)
-                    uids = [uid for uid in search_date_uids(client, from_date, None) if uid <= checkpoint]
-                    pending = set()
+                    raise SkillError("FIRST_RUN_MODE_REQUIRED", "首次扫描必须选择明确日期范围或从现在开始增量")
                 else:
                     uids = sorted(set(search_new_uids(client, last_uid)) | previous_pending)
-                    pending = set()
+                    pending = set(uids)
                     checkpoint = max([last_uid, *uids])
             except Exception as exc:
                 output.append(
@@ -809,15 +1046,47 @@ def run_account_once(
                 )
                 continue
 
-            for uid in uids:
+            folder_state["pending_uids"] = sorted(pending)
+            if not explicit_range or initialize_from_range:
+                folder_state["last_uid"] = checkpoint
+                folder_state["initialized"] = True
+            if state_saver:
+                state_saver()
+            emit_progress("folder_candidates", account=email, folder=display_name, count=len(uids))
+
+            for index, uid in enumerate(uids, start=1):
+                emit_progress("message_start", account=email, folder=display_name, uid=uid, index=index, total=len(uids))
                 try:
                     raw = fetch_message(client, uid)
-                    items, incomplete = process_message(raw, root, state, temp_dir, trusted_domains)
+                    items, incomplete = process_message(
+                        raw,
+                        root,
+                        state,
+                        temp_dir,
+                        trusted_domains,
+                        {"account": email, "folder": display_name, "uid": uid},
+                    )
                     output.extend(items)
                     if incomplete:
                         pending.add(uid)
                     else:
                         pending.discard(uid)
+                except (socket.timeout, imaplib.IMAP4.abort, OSError, ssl.SSLError) as exc:
+                    pending.add(uid)
+                    output.append(
+                        report_item(
+                            "error",
+                            f"邮件UID:{uid}",
+                            "",
+                            email,
+                            f"IMAP 命令超时或连接中断：{type(exc).__name__}",
+                            "IMAP_COMMAND_TIMEOUT",
+                        )
+                    )
+                    folder_state["pending_uids"] = sorted(pending)
+                    if state_saver:
+                        state_saver()
+                    return output
                 except Exception as exc:
                     pending.add(uid)
                     output.append(
@@ -830,11 +1099,10 @@ def run_account_once(
                             error_code(exc, "MESSAGE_PROCESS_FAILED"),
                         )
                     )
-
-            folder_state["pending_uids"] = sorted(pending)
-            if not explicit_range:
-                folder_state["last_uid"] = checkpoint
-                folder_state["initialized"] = True
+                folder_state["pending_uids"] = sorted(pending)
+                if state_saver:
+                    state_saver()
+                emit_progress("message_done", account=email, folder=display_name, uid=uid)
     return output
 
 
@@ -847,6 +1115,8 @@ def run_account(
     temp_dir: Path,
     explicit_range: bool,
     trusted_domains: Iterable[str],
+    start_from_now: bool = False,
+    state_saver: Any | None = None,
 ) -> list[dict[str, str]]:
     email = account["email"]
     try:
@@ -869,6 +1139,8 @@ def run_account(
                 temp_dir,
                 explicit_range,
                 trusted_domains,
+                start_from_now,
+                state_saver,
             )
         except SkillError as exc:
             return [report_item("error", "邮箱", "", email, str(exc), exc.code)]
@@ -901,6 +1173,36 @@ def validate_account(provider: str, email: str) -> str:
     return email
 
 
+def validate_credentials(provider_name: str, email: str, secret: str) -> None:
+    provider = PROVIDERS[provider_name]
+    try:
+        with imaplib.IMAP4_SSL(
+            provider["imap"], provider["port"], ssl_context=tls_context(), timeout=IMAP_TIMEOUT_SECONDS
+        ) as client:
+            client.login(email, secret)
+            send_imap_identity(client, provider_name)
+    except imaplib.IMAP4.error as exc:
+        raise SkillError("IMAP_AUTH_FAILED", "IMAP 登录失败，请检查服务开关和客户端授权码") from exc
+    except (OSError, ssl.SSLError) as exc:
+        raise SkillError("IMAP_NETWORK_FAILED", f"IMAP TLS 连接失败：{type(exc).__name__}") from exc
+
+
+def save_account(provider: str, email: str, secret: str) -> None:
+    try:
+        credential_set(email, secret)
+    except Exception as exc:
+        raise SkillError("KEYRING_ERROR", f"系统凭据库写入失败：{type(exc).__name__}") from exc
+    config = load_config()
+    accounts = config.setdefault("accounts", [])
+    existing = next((item for item in accounts if item.get("email", "").lower() == email), None)
+    if existing:
+        existing.update({"provider": provider, "enabled": True})
+        existing.setdefault("scan_confirmed", False)
+    else:
+        accounts.append({"email": email, "provider": provider, "enabled": True, "scan_confirmed": False})
+    atomic_json_write(config_path(), config)
+
+
 def cmd_configure(args: argparse.Namespace) -> int:
     email = validate_account(args.provider, args.email)
     if not sys.stdin.isatty():
@@ -911,19 +1213,87 @@ def cmd_configure(args: argparse.Namespace) -> int:
     secret = getpass.getpass(f"请输入 {email} 的客户端授权码（输入不会显示）：").strip()
     if not secret:
         raise SystemExit("授权码不能为空。")
-    try:
-        credential_set(email, secret)
-    except Exception as exc:
-        raise SkillError("KEYRING_ERROR", f"系统凭据库写入失败：{type(exc).__name__}") from exc
-    config = load_config()
-    accounts = config.setdefault("accounts", [])
-    existing = next((item for item in accounts if item.get("email", "").lower() == email), None)
-    if existing:
-        existing.update({"provider": args.provider, "enabled": True})
-    else:
-        accounts.append({"email": email, "provider": args.provider, "enabled": True})
-    atomic_json_write(config_path(), config)
+    validate_credentials(args.provider, email, secret)
+    save_account(args.provider, email, secret)
     print(f"已安全配置：{email}")
+    return 0
+
+
+def configuration_page(provider: str, email: str, token: str, error: str = "") -> str:
+    error_html = f'<p class="error">{html_module.escape(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>邮箱发票下载器配置</title><style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f7fb;margin:0;padding:32px}}
+main{{max-width:520px;margin:auto;background:white;padding:28px;border-radius:14px;box-shadow:0 8px 30px #0001}}
+label{{display:block;margin:16px 0 6px}} input{{box-sizing:border-box;width:100%;padding:12px;border:1px solid #ccd3df;border-radius:8px}}
+button{{margin-top:22px;width:100%;padding:12px;border:0;border-radius:8px;background:#1769e0;color:white;font-size:16px}}
+.note{{color:#596579;font-size:14px;line-height:1.6}} .error{{color:#b42318;background:#fee4e2;padding:10px;border-radius:8px}}
+</style></head><body><main><h1>配置 {html_module.escape(provider.upper())} 邮箱</h1>
+<p class="note">授权码只会提交给本机 127.0.0.1，并直接写入系统凭据库。页面不会联网发送、记录或回显授权码。</p>
+{error_html}<form method="post" autocomplete="off">
+<input type="hidden" name="token" value="{html_module.escape(token)}">
+<input type="hidden" name="provider" value="{html_module.escape(provider)}">
+<label>邮箱地址</label><input name="email" type="email" readonly value="{html_module.escape(email)}">
+<label>客户端授权码</label><input name="secret" type="password" required autofocus autocomplete="new-password">
+<button type="submit">验证并安全保存</button></form></main></body></html>"""
+
+
+def cmd_configure_ui(args: argparse.Namespace) -> int:
+    provider = args.provider
+    email = validate_account(provider, args.email)
+    token = secrets.token_urlsafe(24)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_values: Any) -> None:
+            return
+
+        def send_html(self, value: str, status: int = 200) -> None:
+            encoded = value.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_GET(self) -> None:  # noqa: N802
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if query.get("token", [""])[0] != token:
+                self.send_html("<h1>链接无效或已过期</h1>", 403)
+                return
+            self.send_html(configuration_page(provider, email, token))
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = min(int(self.headers.get("Content-Length", "0")), 65536)
+            values = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
+            if values.get("token", [""])[0] != token:
+                self.send_html("<h1>请求无效或已过期</h1>", 403)
+                return
+            secret = values.get("secret", [""])[0].strip()
+            try:
+                if not secret:
+                    raise ValueError("授权码不能为空")
+                validate_credentials(provider, email, secret)
+                save_account(provider, email, secret)
+            except Exception as exc:
+                self.send_html(configuration_page(provider, email, token, str(exc)), 400)
+                return
+            self.server.configuration_complete = True  # type: ignore[attr-defined]
+            self.send_html("<h1>配置成功</h1><p>账号已验证并保存到系统凭据库，可以关闭此页面并返回 Agent。</p>")
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.configuration_complete = False  # type: ignore[attr-defined]
+        server.timeout = 1
+        url = f"http://127.0.0.1:{server.server_port}/?token={token}"
+        print(json.dumps({"status": "waiting_for_user", "url": url, "email": email}, ensure_ascii=False), flush=True)
+        webbrowser.open(url)
+        deadline = time.monotonic() + 600
+        while not server.configuration_complete and time.monotonic() < deadline:  # type: ignore[attr-defined]
+            server.handle_request()
+        if not server.configuration_complete:  # type: ignore[attr-defined]
+            raise SkillError("CONFIGURATION_TIMEOUT", "本地配置页面等待超时，请重新启动")
+    print(json.dumps({"status": "configured", "email": email}, ensure_ascii=False))
     return 0
 
 
@@ -933,7 +1303,6 @@ def cmd_accounts(_args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "invoice_root": config["invoice_root"],
-                "first_run_confirmed": config["first_run_confirmed"],
                 "trusted_domains": config["trusted_domains"],
                 "accounts": config["accounts"],
             },
@@ -942,6 +1311,28 @@ def cmd_accounts(_args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def cmd_preflight(_args: argparse.Namespace) -> int:
+    import certifi
+    import keyring
+    import pdfplumber
+    import pypdf
+
+    ca_path = Path(certifi.where())
+    result = {
+        "ok": sys.version_info >= (3, 10) and ca_path.is_file(),
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+        "ca_bundle": str(ca_path),
+        "ca_bundle_exists": ca_path.is_file(),
+        "keyring_backend": type(keyring.get_keyring()).__name__,
+        "dependencies": {"pypdf": pypdf.__version__, "pdfplumber": pdfplumber.__version__},
+        "data_dir": str(app_data_dir()),
+        "invoice_root": load_config()["invoice_root"],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["ok"] else 2
 
 
 def find_account(config: dict[str, Any], email: str) -> dict[str, Any]:
@@ -1033,22 +1424,35 @@ def scan_metadata(
     explicit_range: bool,
     from_date: dt.date,
     to_date: dt.date | None,
-    today: dt.date,
-    initial_lookback_days: int,
+    start_from_now: bool = False,
+    initializing: bool = False,
 ) -> dict[str, Any]:
+    if start_from_now:
+        return {
+            "mode": "incremental_from_now_initialized",
+            "description": "已记录当前 UID；本次不读取历史邮件，后续只处理新邮件",
+        }
     if explicit_range:
         return {
-            "mode": "date_range_rescan",
+            "mode": "date_range_initial" if initializing else "date_range_rescan",
             "from": str(from_date),
-            "to": str(to_date or today),
-            "last_uid_advanced": False,
+            "to": str(to_date),
+            "last_uid_advanced": initializing,
             "pending_uids_updated": True,
         }
     return {
         "mode": "uid_incremental",
-        "new_folder_initial_lookback_days": initial_lookback_days,
-        "description": "新文件夹首次回溯指定天数；已初始化文件夹扫描 last_uid 之后及 pending_uids 中的邮件",
+        "description": "扫描 last_uid 之后及 pending_uids 中的邮件，不使用隐含日期窗口",
     }
+
+
+def rebuild_file_index(root: Path, state: dict[str, Any]) -> None:
+    files = state.setdefault("files", {})
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in {".pdf", ".ofd"}:
+            files.setdefault(sha256_file(path), str(path))
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1058,27 +1462,39 @@ def cmd_run(args: argparse.Namespace) -> int:
         accounts = [item for item in accounts if item.get("email", "").lower() == args.account.lower()]
     if not accounts:
         raise ValueError("没有可运行的已启用邮箱账号")
-    first_run_needs_persisting = not config.get("first_run_confirmed", False)
-    if first_run_needs_persisting and not args.confirm_first_run:
-        emails = "、".join(item["email"] for item in accounts)
-        raise SkillError(
-            "FIRST_RUN_CONFIRMATION_REQUIRED",
-            f"首次扫描需要用户确认；邮箱：{emails}；写入目录：{config['invoice_root']}。确认后添加 --confirm-first-run",
-        )
-    today = dt.date.today()
     explicit_from = parse_iso_date(args.from_date, "--from-date")
     to_date = parse_iso_date(args.to_date, "--to-date")
-    explicit_range = bool(args.from_date or args.to_date)
-    initial_lookback_days = int(config.get("initial_lookback_days", 30))
-    from_date = explicit_from or today - dt.timedelta(days=initial_lookback_days)
+    if bool(explicit_from) != bool(to_date):
+        raise ValueError("指定日期范围时必须同时提供 --from-date 和 --to-date")
+    explicit_range = explicit_from is not None and to_date is not None
+    start_from_now = bool(getattr(args, "start_from_now", False))
+    if explicit_range and start_from_now:
+        raise ValueError("日期范围与 --start-from-now 不能同时使用")
+
+    unconfirmed = [item for item in accounts if not item.get("scan_confirmed", False)]
+    if unconfirmed and not args.confirm_first_run:
+        emails = "、".join(item["email"] for item in unconfirmed)
+        raise SkillError(
+            "FIRST_RUN_CONFIRMATION_REQUIRED",
+            f"首次运行需要用户选择日期范围或从现在开始增量，并确认邮箱：{emails}；写入目录：{config['invoice_root']}",
+        )
+    if unconfirmed and not (explicit_range or start_from_now):
+        raise SkillError(
+            "FIRST_RUN_MODE_REQUIRED",
+            "首次运行不再默认回溯30天；请选择 --from-date/--to-date，或使用 --start-from-now",
+        )
+    today = dt.date.today()
+    from_date = explicit_from or today
     if to_date and from_date > to_date:
         raise ValueError("开始日期不能晚于结束日期")
     root = Path(config["invoice_root"]).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    if first_run_needs_persisting:
-        config["first_run_confirmed"] = True
+    if unconfirmed:
+        for account in unconfirmed:
+            account["scan_confirmed"] = True
         atomic_json_write(config_path(), config)
     state = load_state()
+    rebuild_file_index(root, state)
     results: list[dict[str, str]] = []
     with exclusive_run_lock(), tempfile.TemporaryDirectory(prefix="invoice-mail-") as temp_name:
         temp_dir = Path(temp_name)
@@ -1093,6 +1509,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                     temp_dir,
                     explicit_range,
                     config.get("trusted_domains", []),
+                    start_from_now,
+                    lambda: atomic_json_write(state_path(), state),
                 )
             )
             atomic_json_write(state_path(), state)
@@ -1101,7 +1519,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "invoice_root": str(root),
-                "scan": scan_metadata(explicit_range, from_date, to_date, today, initial_lookback_days),
+                "scan": scan_metadata(explicit_range, from_date, to_date, start_from_now, bool(unconfirmed)),
                 "counts": counts,
                 "items": results,
             },
@@ -1121,8 +1539,16 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--email", required=True)
     configure.set_defaults(handler=cmd_configure)
 
+    configure_ui = subparsers.add_parser("configure-ui", help="在本机浏览器中安全配置邮箱账号")
+    configure_ui.add_argument("--provider", choices=sorted(PROVIDERS), required=True)
+    configure_ui.add_argument("--email", required=True)
+    configure_ui.set_defaults(handler=cmd_configure_ui)
+
     accounts = subparsers.add_parser("accounts", help="查看非敏感配置")
     accounts.set_defaults(handler=cmd_accounts)
+
+    preflight = subparsers.add_parser("preflight", help="检查 Python、CA 证书、凭据库和依赖")
+    preflight.set_defaults(handler=cmd_preflight)
 
     set_root = subparsers.add_parser("set-root", help="修改默认发票目录")
     set_root.add_argument("path")
@@ -1149,8 +1575,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="执行一次扫描、下载和归档")
     run.add_argument("--account", help="只运行指定邮箱")
-    run.add_argument("--from-date", help="开始日期 YYYY-MM-DD")
-    run.add_argument("--to-date", help="结束日期 YYYY-MM-DD")
+    run.add_argument("--from-date", help="邮件接收开始日期 YYYY-MM-DD，必须与 --to-date 同时使用")
+    run.add_argument("--to-date", help="邮件接收结束日期 YYYY-MM-DD，必须与 --from-date 同时使用")
+    run.add_argument("--start-from-now", action="store_true", help="首次不扫描历史邮件，只建立增量 UID 起点")
     run.add_argument("--confirm-first-run", action="store_true", help="确认首次邮箱读取和本地写入")
     run.set_defaults(handler=cmd_run)
     return parser
