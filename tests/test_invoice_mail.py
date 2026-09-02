@@ -16,6 +16,22 @@ invoice_mail = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(invoice_mail)
 
 
+INVOICE_TEXT = (
+    "电子发票 发票号码：12345678901234567890 开票日期：2026年09月02日 "
+    "销售方名称：测试公司 统一社会信用代码 1 价税合计（小写）：￥128.00"
+)
+
+
+def ofd_bytes(text: str = INVOICE_TEXT) -> bytes:
+    from io import BytesIO
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("OFD.xml", "<OFD></OFD>")
+        archive.writestr("Doc_0/Pages/Page_0/Content.xml", f"<TextCode>{text}</TextCode>")
+    return output.getvalue()
+
+
 class InvoiceMailTests(unittest.TestCase):
     def test_extract_fields(self) -> None:
         text = "开票日期：2026年09月02日 销售方名称：上海某科技公司 统一社会信用代码 123 价税合计（小写）：￥128.00"
@@ -46,6 +62,10 @@ class InvoiceMailTests(unittest.TestCase):
     def test_bank_transfer_form_is_not_invoice(self) -> None:
         text = "境外汇款申请书 APPLICATION FOR FUNDS TRANSFERS 本笔款项是否为报税货物项下付款 发票号"
         self.assertFalse(invoice_mail.is_invoice_document(text, "境外汇款申请书.pdf"))
+
+    def test_invoice_identity_uses_invoice_number_not_bare_date(self) -> None:
+        self.assertEqual(invoice_mail.invoice_identity(INVOICE_TEXT), "number:12345678901234567890")
+        self.assertEqual(invoice_mail.invoice_identity("电子发票 开票日期：2026-09-02", "20260902.pdf"), "")
 
     def test_candidate_links_require_context(self) -> None:
         html = '<a href="https://example.com/a">退订</a><a href="https://example.com/b">下载发票</a>'
@@ -92,6 +112,61 @@ class InvoiceMailTests(unittest.TestCase):
             result = invoice_mail.process_file(path, path.name, root / "out", {"files": {}}, root)
             self.assertEqual(result[0][0], "incomplete")
             self.assertIn("50 MB", result[0][2])
+
+    def test_same_invoice_prefers_pdf_over_ofd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            pdf = root / "invoice.pdf"
+            ofd = root / "invoice.ofd"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            ofd.write_bytes(ofd_bytes())
+            state: dict[str, object] = {"files": {}, "provenance": {}, "invoice_formats": {}}
+            seen: set[str] = set()
+            with (
+                mock.patch.object(invoice_mail, "pdf_text", return_value=INVOICE_TEXT),
+                mock.patch.object(invoice_mail, "ofd_text", return_value=INVOICE_TEXT),
+            ):
+                pdf_result = invoice_mail.process_file(pdf, pdf.name, root / "out", state, root, seen_pdf_keys=seen)
+                ofd_result = invoice_mail.process_file(ofd, ofd.name, root / "out", state, root, seen_pdf_keys=seen)
+            self.assertEqual(pdf_result[0][0], "success")
+            self.assertEqual(ofd_result[0][0], "skipped")
+            self.assertIn("已有 PDF", ofd_result[0][2])
+            self.assertEqual([path.suffix for path in (root / "out").rglob("*") if path.is_file()], [".pdf"])
+
+    def test_later_pdf_removes_recorded_ofd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            pdf = root / "invoice.pdf"
+            ofd = root / "invoice.ofd"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            ofd.write_bytes(ofd_bytes())
+            state: dict[str, object] = {"files": {}, "provenance": {}, "invoice_formats": {}}
+            with (
+                mock.patch.object(invoice_mail, "pdf_text", return_value=INVOICE_TEXT),
+                mock.patch.object(invoice_mail, "ofd_text", return_value=INVOICE_TEXT),
+            ):
+                ofd_result = invoice_mail.process_file(ofd, ofd.name, root / "out", state, root)
+                pdf_result = invoice_mail.process_file(pdf, pdf.name, root / "out", state, root)
+            self.assertEqual(ofd_result[0][0], "success")
+            self.assertEqual(pdf_result[0][0], "success")
+            self.assertIn("已移除同一发票的 OFD", pdf_result[0][2])
+            self.assertEqual([path.suffix for path in (root / "out").rglob("*") if path.is_file()], [".pdf"])
+
+    def test_zip_with_same_invoice_keeps_only_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            package = root / "invoices.zip"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("same.ofd", ofd_bytes())
+                archive.writestr("same.pdf", b"%PDF-1.4\n%%EOF")
+            state: dict[str, object] = {"files": {}, "provenance": {}, "invoice_formats": {}}
+            with (
+                mock.patch.object(invoice_mail, "pdf_text", return_value=INVOICE_TEXT),
+                mock.patch.object(invoice_mail, "ofd_text", return_value=INVOICE_TEXT),
+            ):
+                results = invoice_mail.process_file(package, package.name, root / "out", state, root)
+            self.assertEqual([result[0] for result in results], ["success", "skipped"])
+            self.assertEqual([path.suffix for path in (root / "out").rglob("*") if path.is_file()], [".pdf"])
 
     def test_message_attachment_is_archived_for_confirmation(self) -> None:
         message = EmailMessage()
