@@ -162,6 +162,7 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" trust-domain fapiao.example.com --con
 - 每个附件独立判断是否为发票；同一封候选邮件中的合同、汇款申请书等非发票 PDF 会跳过。
 - PDF 先按页面布局提取，再使用普通文本提取降级；铁路电子客票使用独立字段规则。
 - 状态按邮件逐条保存，并记录文件哈希对应的邮箱、文件夹、UID、主题、原附件名或脱敏链接，便于追溯。
+- 每次运行先核对已登记的归档文件：文件在根目录内被移动时按哈希更新路径；文件确实缺失时，将其来源邮件 UID 自动加入待重试队列，由普通增量扫描补下载。
 - 具体下载、重试、解压和大小限制以脚本为唯一事实来源，不在本文件重复维护。
 
 向用户概括脚本 JSON 中的：成功、跳过、未完成、错误、邮件主题、发件人、归档路径和错误码。不得展示邮件正文、授权码或带查询参数的完整 URL。
@@ -184,6 +185,7 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" trust-domain fapiao.example.com --con
 - `IMAP_COMMAND_TIMEOUT`：单封邮件或命令超时；已逐条保存进度并保留 UID，下一次运行继续重试。
 - `MESSAGE_TOO_LARGE`：邮件超过安全上限，保留为未完成，不下载整封邮件。
 - `PDF_TEXT_EXTRACTION_FAILED`：PDF 文本层异常且布局提取也失败；保留为未完成，不把字段全部静默改为未知。
+- `ARCHIVE_MISSING_SOURCE_UNAVAILABLE`：归档文件已丢失，但旧状态没有邮箱文件夹或 UID，无法自动回补；需用日期范围重扫原邮件。
 - `DOWNLOAD_*`：保留失败项并继续；认证、验证码或动态网页由用户另行处理。
 
 ## 管理命令
