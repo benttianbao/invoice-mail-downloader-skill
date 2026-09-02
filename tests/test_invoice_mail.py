@@ -86,6 +86,10 @@ class InvoiceMailTests(unittest.TestCase):
             ["https://example.com/download/invoice.pdf"],
         )
 
+    def test_candidate_links_exclude_nuonuo_homepage(self) -> None:
+        html = '<a href="https://fp.nuonuo.com/">诺诺发票</a>'
+        self.assertEqual(invoice_mail.extract_candidate_links("", html), [])
+
     def test_download_links_prefer_pdf_and_ofd_last(self) -> None:
         links = [
             "https://example.com/invoice.ofd",
@@ -93,6 +97,51 @@ class InvoiceMailTests(unittest.TestCase):
             "https://example.com/invoice.pdf",
         ]
         self.assertEqual(invoice_mail.prioritized_download_links(links), [links[2], links[1], links[0]])
+
+    def test_baiwang_provider_builds_pdf_download_url(self) -> None:
+        links = invoice_mail.provider_download_links(
+            "https://pis.baiwang.com/smkp-vue/previewInvoiceAllEle?param=secret-value",
+            ["pis.baiwang.com"],
+        )
+        parts = invoice_mail.urllib.parse.urlsplit(links[0])
+        self.assertEqual(parts.path, "/bwmg/mix/bw/downloadFormat")
+        self.assertEqual(invoice_mail.urllib.parse.parse_qs(parts.query), {"param": ["secret-value"], "formatType": ["PDF"]})
+
+    def test_nuonuo_provider_resolves_pdf_from_detail_api(self) -> None:
+        class FakeResponse:
+            def __init__(self, body: bytes, url: str) -> None:
+                self.body = body
+                self.url = url
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, _limit: int = -1) -> bytes:
+                return self.body
+
+            def geturl(self) -> str:
+                return self.url
+
+        final_url = (
+            "https://nnfp.jss.com.cn/scan-invoice/printQrcode?"
+            "paramList=encoded-secret&aliView=1&shortLinkSource=mail"
+        )
+        pdf_url = "https://inv.jss.com.cn/fp2/invoice.pdf"
+        opener = mock.Mock()
+        opener.open.side_effect = [
+            FakeResponse(b"<html></html>", final_url),
+            FakeResponse(invoice_mail.json.dumps({"data": {"invoiceSimpleVo": {"url": pdf_url}}}).encode(), final_url),
+        ]
+        with (
+            mock.patch.object(invoice_mail, "validate_public_https"),
+            mock.patch.object(invoice_mail, "provider_opener", return_value=opener),
+        ):
+            links = invoice_mail.provider_download_links("https://nnfp.jss.com.cn/short-code", ["nnfp.jss.com.cn"])
+        self.assertEqual(links, [pdf_url])
+        self.assertEqual(opener.open.call_count, 2)
 
     def test_redact_url(self) -> None:
         value = invoice_mail.redact_url("https://example.com/download/a.pdf?token=secret#part")
