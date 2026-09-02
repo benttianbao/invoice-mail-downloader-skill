@@ -67,6 +67,7 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 - 授权码只保存到 macOS 钥匙串或 Windows 凭据管理器；
 - 每个新账号首次运行时，由用户选择邮件日期范围或从现在开始只增量获取；
 - 同一票号同时提供 PDF/OFD 时仅保留 PDF，ZIP 内也应用相同规则；
+- 已登记文件被删除后会自动回补原邮件；只在归档根目录内移动则按哈希更新路径，不重复下载；
 - 修改归档目录和增加可信下载域名都需要用户明确确认。
 
 安装隔离依赖：
@@ -108,4 +109,4 @@ python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --s
 python -m unittest discover -s tests -v
 ```
 
-当前包含 35 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
+当前包含 38 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
