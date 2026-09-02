@@ -108,4 +108,4 @@ python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --s
 python -m unittest discover -s tests -v
 ```
 
-当前包含 34 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
+当前包含 35 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
