@@ -153,6 +153,7 @@ def load_state() -> dict[str, Any]:
             "provenance": {},
             "invoice_formats": {},
             "invoice_format_index_built": False,
+            "invoice_identity_version": 0,
         },
     )
     state.setdefault("folders", {})
@@ -160,6 +161,7 @@ def load_state() -> dict[str, Any]:
     state.setdefault("provenance", {})
     state.setdefault("invoice_formats", {})
     state.setdefault("invoice_format_index_built", False)
+    state.setdefault("invoice_identity_version", 0)
     state["version"] = 4
     return state
 
@@ -288,7 +290,12 @@ def extract_candidate_links(plain: str, html: str, message_is_candidate: bool = 
     with contextlib.suppress(Exception):
         parser.feed(html)
     for url, label in parser.links:
-        suffix = Path(urllib.parse.urlsplit(url).path).suffix.lower()
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme.lower() not in {"http", "https"}:
+            continue
+        suffix = Path(parts.path).suffix.lower()
+        if suffix and suffix not in SUPPORTED_SUFFIXES:
+            continue
         if has_invoice_keyword(label + " " + url) or (message_is_candidate and suffix in SUPPORTED_SUFFIXES):
             candidates.append(url)
 
@@ -297,9 +304,17 @@ def extract_candidate_links(plain: str, html: str, message_is_candidate: bool = 
         url = match.group(0).rstrip(".,;:!?)]}，。；：！？）】")
         window = plain[max(0, match.start() - 100) : min(len(plain), match.end() + 100)]
         suffix = Path(urllib.parse.urlsplit(url).path).suffix.lower()
+        if suffix and suffix not in SUPPORTED_SUFFIXES:
+            continue
         if has_invoice_keyword(window) or (message_is_candidate and suffix in SUPPORTED_SUFFIXES):
             candidates.append(url)
     return list(dict.fromkeys(candidates))
+
+
+def prioritized_download_links(links: Iterable[str]) -> list[str]:
+    priority = {".pdf": 0, ".zip": 1, "": 2, ".ofd": 3}
+    unique = list(dict.fromkeys(links))
+    return sorted(unique, key=lambda url: priority.get(Path(urllib.parse.urlsplit(url).path).suffix.lower(), 2))
 
 
 def message_content(message: Message) -> tuple[str, str, list[tuple[str, bytes]]]:
@@ -598,7 +613,7 @@ def invoice_identity(text: str, filename: str = "") -> str:
                 return f"number:{number}"
 
     # 仅当文件名明确标注票号时才降级使用文件名，避免把日期误当发票号码。
-    if match := re.search(r"(?:发票|票号|invoice)[^0-9]{0,12}([0-9]{8,30})", filename, re.I):
+    if match := re.search(r"(?:dzfp[_-]?|发票|票号|invoice)[^0-9]{0,12}([0-9]{8,30})", filename, re.I):
         return f"number:{match.group(1)}"
     return ""
 
@@ -866,7 +881,7 @@ def process_file(
         except (ValueError, zipfile.BadZipFile) as exc:
             return [("incomplete", hinted_name, str(exc))]
         if not extracted:
-            return [("incomplete", hinted_name, "ZIP 中没有有效 PDF/OFD")]
+            return [("skipped", hinted_name, "ZIP 中没有有效 PDF/OFD，原 ZIP 不保留")]
         results: list[tuple[str, str, str]] = []
         for extracted_file, member_name in extracted:
             child_provenance = dict(provenance or {})
@@ -953,7 +968,7 @@ def process_message(
             ):
                 items.append(report_item(status, f"附件:{source}", subject, sender, detail))
 
-        links = extract_candidate_links(plain, html, candidate)
+        links = prioritized_download_links(extract_candidate_links(plain, html, candidate))
         for index, url in enumerate(links, start=1):
             target = message_tmp / f"download-{index}"
             redacted = redact_url(url)
@@ -961,11 +976,11 @@ def process_message(
                 content_type, filename = download_http(url, target, trusted_domains)
                 if content_type in {"text/html", "application/xhtml+xml"} or target.read_bytes()[:256].lstrip().lower().startswith(b"<"):
                     page_html = target.read_text(encoding="utf-8", errors="replace")
-                    page_links = [
+                    page_links = prioritized_download_links([
                         urllib.parse.urljoin(url, child)
                         for child in extract_candidate_links("", page_html, True)
                         if urllib.parse.urljoin(url, child) != url
-                    ]
+                    ])
                     target.unlink(missing_ok=True)
                     if page_links:
                         for child_index, child_url in enumerate(dict.fromkeys(page_links), start=1):
@@ -1575,6 +1590,42 @@ def rebuild_file_index(root: Path, state: dict[str, Any]) -> None:
     state["invoice_format_index_built"] = True
 
 
+def provenance_filename(provenance: dict[str, Any], fallback: str) -> str:
+    if provenance.get("original_filename"):
+        return str(provenance["original_filename"])
+    if provenance.get("source_url"):
+        path = urllib.parse.urlsplit(str(provenance["source_url"])).path
+        return urllib.parse.unquote(Path(path).name)
+    return fallback
+
+
+def rebuild_invoice_identity_index(root: Path, state: dict[str, Any]) -> None:
+    """票号规则升级后，使用已记录来源重建格式索引并清理同票号 OFD。"""
+    if int(state.get("invoice_identity_version", 0)) >= 2:
+        return
+    formats = state.setdefault("invoice_formats", {})
+    provenance_by_digest = state.setdefault("provenance", {})
+    for digest, value in list(state.setdefault("files", {}).items()):
+        path = Path(value)
+        if not path.exists() or path.suffix.lower() not in {".pdf", ".ofd"}:
+            continue
+        provenance = provenance_by_digest.get(digest, {})
+        hint = provenance_filename(provenance, path.name)
+        invoice_key = invoice_identity("", hint)
+        if not invoice_key:
+            try:
+                text = pdf_text(path) if path.suffix.lower() == ".pdf" else ofd_text(path)
+            except Exception:
+                continue
+            invoice_key = invoice_identity(text, hint)
+        if invoice_key:
+            formats.setdefault(invoice_key, {})[path.suffix.lower().lstrip(".")] = str(path)
+    for invoice_key, available in list(formats.items()):
+        if available.get("pdf") and available.get("ofd"):
+            remove_recorded_ofd(state, invoice_key, root)
+    state["invoice_identity_version"] = 2
+
+
 def folder_state_key_from_provenance(state: dict[str, Any], provenance: dict[str, Any]) -> str:
     explicit = str(provenance.get("folder_state_key", ""))
     if explicit in state.setdefault("folders", {}):
@@ -1670,6 +1721,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         atomic_json_write(config_path(), config)
     state = load_state()
     rebuild_file_index(root, state)
+    rebuild_invoice_identity_index(root, state)
     results = requeue_missing_archives(state)
     with exclusive_run_lock(), tempfile.TemporaryDirectory(prefix="invoice-mail-") as temp_name:
         temp_dir = Path(temp_name)
