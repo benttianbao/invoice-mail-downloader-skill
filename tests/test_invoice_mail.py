@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+import importlib.util
+from email.message import EmailMessage
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+import zipfile
+
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "invoice_mail.py"
+SPEC = importlib.util.spec_from_file_location("invoice_mail", MODULE_PATH)
+assert SPEC and SPEC.loader
+invoice_mail = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(invoice_mail)
+
+
+class InvoiceMailTests(unittest.TestCase):
+    def test_extract_fields(self) -> None:
+        text = "开票日期：2026年09月02日 销售方名称：上海某科技公司 统一社会信用代码 123 价税合计（小写）：￥128.00"
+        self.assertEqual(
+            invoice_mail.extract_invoice_fields(text),
+            {"date": "2026-09-02", "seller": "上海某科技公司", "amount": "128.00"},
+        )
+
+    def test_candidate_links_require_context(self) -> None:
+        html = '<a href="https://example.com/a">退订</a><a href="https://example.com/b">下载发票</a>'
+        self.assertEqual(invoice_mail.extract_candidate_links("", html), ["https://example.com/b"])
+
+    def test_redact_url(self) -> None:
+        value = invoice_mail.redact_url("https://example.com/download/a.pdf?token=secret#part")
+        self.assertEqual(value, "https://example.com/download/a.pdf")
+
+    def test_ofd_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "sample.ofd"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("OFD.xml", "<OFD></OFD>")
+                archive.writestr("Doc_0/Pages/Page_0/Content.xml", '<TextCode>开票日期：2026-09-02</TextCode>')
+            self.assertIn("2026-09-02", invoice_mail.ofd_text(path))
+            self.assertEqual(invoice_mail.detect_file_type(path), ".ofd")
+
+    def test_zip_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "bad.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("../invoice.pdf", b"%PDF-1.4")
+            with self.assertRaisesRegex(ValueError, "路径穿越"):
+                invoice_mail.safe_zip_members(path)
+
+    def test_zip_ignores_nested_zip_and_other_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "mixed.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("invoice.pdf", b"%PDF-1.4")
+                archive.writestr("nested.zip", b"PK\x03\x04")
+                archive.writestr("notes.txt", b"ignore")
+            selected = invoice_mail.safe_zip_members(path)
+            self.assertEqual([item.filename for item in selected], ["invoice.pdf"])
+
+    def test_process_file_rejects_oversized_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            path = root / "large.pdf"
+            with path.open("wb") as handle:
+                handle.seek(invoice_mail.MAX_FILE_BYTES)
+                handle.write(b"x")
+            result = invoice_mail.process_file(path, path.name, root / "out", {"files": {}}, root)
+            self.assertEqual(result[0][0], "incomplete")
+            self.assertIn("50 MB", result[0][2])
+
+    def test_message_attachment_is_archived_for_confirmation(self) -> None:
+        message = EmailMessage()
+        message["Subject"] = "您的电子发票"
+        message["From"] = "billing@example.com"
+        message.set_content("发票见附件")
+        message.add_attachment(b"%PDF-1.4\n%%EOF", maintype="application", subtype="pdf", filename="invoice.pdf")
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            state = {"files": {}}
+            items, incomplete = invoice_mail.process_message(message.as_bytes(), root / "Invoices", state, root)
+            self.assertFalse(incomplete)
+            self.assertEqual(items[0]["status"], "success")
+            self.assertIn("待确认", items[0]["detail"])
+
+    def test_candidate_without_download_is_incomplete(self) -> None:
+        message = EmailMessage()
+        message["Subject"] = "电子发票通知"
+        message["From"] = "billing@example.com"
+        message.set_content("本邮件不包含附件或链接")
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            items, incomplete = invoice_mail.process_message(message.as_bytes(), root / "Invoices", {"files": {}}, root)
+            self.assertTrue(incomplete)
+            self.assertIn("未发现", items[0]["detail"])
+
+    def test_modified_utf7_folder_name_is_decoded(self) -> None:
+        import base64
+
+        encoded = base64.b64encode("发票归档".encode("utf-16-be")).decode("ascii").rstrip("=").replace("/", ",")
+        self.assertEqual(invoice_mail.decode_modified_utf7(f"&{encoded}-"), "发票归档")
+
+    def test_untrusted_domain_is_rejected_before_download(self) -> None:
+        with self.assertRaises(invoice_mail.SkillError) as caught:
+            invoice_mail.validate_public_https("https://evil.example/invoice.pdf", ["trusted.example"])
+        self.assertEqual(caught.exception.code, "UNTRUSTED_DOMAIN")
+        self.assertFalse(invoice_mail.domain_is_trusted("cdn.trusted.example", ["trusted.example"]))
+
+    def test_configure_refuses_non_interactive_input(self) -> None:
+        args = type("Args", (), {"provider": "163", "email": "user@163.com"})()
+        with mock.patch.object(invoice_mail.sys.stdin, "isatty", return_value=False):
+            with self.assertRaises(invoice_mail.SkillError) as caught:
+                invoice_mail.cmd_configure(args)
+        self.assertEqual(caught.exception.code, "INTERACTIVE_TERMINAL_REQUIRED")
+
+    def test_first_run_requires_explicit_confirmation(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {"account": None, "confirm_first_run": False, "from_date": None, "to_date": None},
+        )()
+        config = {
+            "invoice_root": "/tmp/invoices",
+            "first_run_confirmed": False,
+            "accounts": [{"email": "user@qq.com", "provider": "qq", "enabled": True}],
+        }
+        with mock.patch.object(invoice_mail, "load_config", return_value=config):
+            with self.assertRaises(invoice_mail.SkillError) as caught:
+                invoice_mail.cmd_run(args)
+        self.assertEqual(caught.exception.code, "FIRST_RUN_CONFIRMATION_REQUIRED")
+
+    def test_invalid_date_does_not_persist_first_run_confirmation(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {"account": None, "confirm_first_run": True, "from_date": "not-a-date", "to_date": None},
+        )()
+        config = {
+            "invoice_root": "/tmp/invoices",
+            "first_run_confirmed": False,
+            "initial_lookback_days": 30,
+            "accounts": [{"email": "user@qq.com", "provider": "qq", "enabled": True}],
+        }
+        with (
+            mock.patch.object(invoice_mail, "load_config", return_value=config),
+            mock.patch.object(invoice_mail, "atomic_json_write") as write_config,
+        ):
+            with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
+                invoice_mail.cmd_run(args)
+        write_config.assert_not_called()
+
+    def test_incremental_scan_metadata_has_no_fake_date_range(self) -> None:
+        metadata = invoice_mail.scan_metadata(
+            False,
+            invoice_mail.dt.date(2026, 8, 3),
+            None,
+            invoice_mail.dt.date(2026, 9, 2),
+            30,
+        )
+        self.assertEqual(metadata["mode"], "uid_incremental")
+        self.assertNotIn("from", metadata)
+        self.assertNotIn("to", metadata)
+
+    def test_date_rescan_metadata_describes_pending_behavior(self) -> None:
+        metadata = invoice_mail.scan_metadata(
+            True,
+            invoice_mail.dt.date(2026, 8, 1),
+            invoice_mail.dt.date(2026, 8, 31),
+            invoice_mail.dt.date(2026, 9, 2),
+            30,
+        )
+        self.assertEqual(metadata["mode"], "date_range_rescan")
+        self.assertFalse(metadata["last_uid_advanced"])
+        self.assertTrue(metadata["pending_uids_updated"])
+
+    def test_163_identity_is_sent(self) -> None:
+        client = mock.Mock()
+        client._simple_command.return_value = ("OK", [b"accepted"])
+        invoice_mail.send_imap_identity(client, "163")
+        client._simple_command.assert_called_once()
+        self.assertEqual(client._simple_command.call_args.args[0], "ID")
+
+    def test_163_identity_is_sent_before_folder_access(self) -> None:
+        events: list[str] = []
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.login.side_effect = lambda *_args: events.append("login") or ("OK", [])
+        client._simple_command.side_effect = lambda *_args: events.append("id") or ("OK", [])
+
+        def folders(_client: object) -> list[tuple[str, str]]:
+            events.append("folders")
+            return []
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            with (
+                mock.patch.object(invoice_mail.imaplib, "IMAP4_SSL", return_value=client),
+                mock.patch.object(invoice_mail, "folder_entries", side_effect=folders),
+            ):
+                invoice_mail.run_account_once(
+                    {"email": "user@163.com", "provider": "163"},
+                    "secret",
+                    Path(temp_name),
+                    {"folders": {}, "files": {}},
+                    invoice_mail.dt.date(2026, 8, 1),
+                    None,
+                    Path(temp_name),
+                    False,
+                    [],
+                )
+        self.assertEqual(events, ["login", "id", "folders"])
+
+    def test_explicit_date_search_does_not_apply_uid_cursor(self) -> None:
+        client = mock.Mock()
+        client.uid.return_value = ("OK", [b"20 21"])
+        values = invoice_mail.search_date_uids(
+            client,
+            invoice_mail.dt.date(2026, 8, 1),
+            invoice_mail.dt.date(2026, 8, 31),
+        )
+        self.assertEqual(values, [20, 21])
+        called = client.uid.call_args.args
+        self.assertNotIn("UID", called)
+
+    def test_incremental_search_uses_uid_without_date_window(self) -> None:
+        client = mock.Mock()
+        client.uid.return_value = ("OK", [b"101 102"])
+        self.assertEqual(invoice_mail.search_new_uids(client, 100), [101, 102])
+        self.assertEqual(client.uid.call_args.args, ("search", None, "UID", "101:*"))
+
+    def test_explicit_range_does_not_advance_incremental_cursor(self) -> None:
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.login.return_value = ("OK", [])
+        client.select.return_value = ("OK", [])
+        client.response.side_effect = lambda name: (name, [b"7"] if name == "UIDVALIDITY" else [b"151"])
+        state = {
+            "folders": {
+                "user@qq.com::INBOX": {
+                    "uidvalidity": 7,
+                    "initialized": True,
+                    "last_uid": 100,
+                    "pending_uids": [30],
+                }
+            },
+            "files": {},
+        }
+        with tempfile.TemporaryDirectory() as temp_name:
+            with (
+                mock.patch.object(invoice_mail.imaplib, "IMAP4_SSL", return_value=client),
+                mock.patch.object(invoice_mail, "folder_entries", return_value=[("INBOX", "INBOX")]),
+                mock.patch.object(invoice_mail, "search_date_uids", return_value=[20]),
+                mock.patch.object(invoice_mail, "fetch_message", return_value=b"message"),
+                mock.patch.object(invoice_mail, "process_message", return_value=([], False)),
+            ):
+                invoice_mail.run_account_once(
+                    {"email": "user@qq.com", "provider": "qq"},
+                    "secret",
+                    Path(temp_name),
+                    state,
+                    invoice_mail.dt.date(2026, 8, 1),
+                    invoice_mail.dt.date(2026, 8, 31),
+                    Path(temp_name),
+                    True,
+                    [],
+                )
+        folder_state = state["folders"]["user@qq.com::INBOX"]
+        self.assertEqual(folder_state["last_uid"], 100)
+        self.assertTrue(folder_state["initialized"])
+        self.assertEqual(folder_state["pending_uids"], [30])
+
+    def test_uidvalidity_change_resets_cursor_before_initial_scan(self) -> None:
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.login.return_value = ("OK", [])
+        client.select.return_value = ("OK", [])
+        client.response.side_effect = lambda name: (name, [b"7"] if name == "UIDVALIDITY" else [b"51"])
+        state = {
+            "folders": {
+                "user@qq.com::INBOX": {
+                    "uidvalidity": 6,
+                    "initialized": True,
+                    "last_uid": 100,
+                    "pending_uids": [90],
+                }
+            },
+            "files": {},
+        }
+        with tempfile.TemporaryDirectory() as temp_name:
+            with (
+                mock.patch.object(invoice_mail.imaplib, "IMAP4_SSL", return_value=client),
+                mock.patch.object(invoice_mail, "folder_entries", return_value=[("INBOX", "INBOX")]),
+                mock.patch.object(invoice_mail, "search_date_uids", return_value=[45]),
+                mock.patch.object(invoice_mail, "fetch_message", return_value=b"message"),
+                mock.patch.object(invoice_mail, "process_message", return_value=([], False)),
+            ):
+                invoice_mail.run_account_once(
+                    {"email": "user@qq.com", "provider": "qq"},
+                    "secret",
+                    Path(temp_name),
+                    state,
+                    invoice_mail.dt.date(2026, 8, 1),
+                    None,
+                    Path(temp_name),
+                    False,
+                    [],
+                )
+        folder_state = state["folders"]["user@qq.com::INBOX"]
+        self.assertEqual(folder_state["uidvalidity"], 7)
+        self.assertEqual(folder_state["last_uid"], 50)
+        self.assertEqual(folder_state["pending_uids"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
