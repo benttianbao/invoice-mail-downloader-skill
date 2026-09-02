@@ -1,0 +1,6 @@
+interface:
+  display_name: "邮箱发票下载整理"
+  short_description: "从163和QQ邮箱安全下载、命名并归档电子发票"
+  default_prompt: "使用 $invoice-mail-downloader 从已配置邮箱下载并整理本次发票。"
+policy:
+  allow_implicit_invocation: false
