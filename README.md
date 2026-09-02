@@ -6,8 +6,16 @@
 
 ### Codex
 
+macOS / Linux：
+
 ```bash
 git clone https://github.com/benttianbao/invoice-mail-downloader-skill.git ~/.codex/skills/invoice-mail-downloader
+```
+
+Windows PowerShell：
+
+```powershell
+git clone https://github.com/benttianbao/invoice-mail-downloader-skill.git "$env:USERPROFILE\.codex\skills\invoice-mail-downloader"
 ```
 
 重新打开会话后显式调用：
@@ -18,8 +26,16 @@ $invoice-mail-downloader
 
 ### WorkBuddy
 
+macOS / Linux：
+
 ```bash
 git clone https://github.com/benttianbao/invoice-mail-downloader-skill.git ~/.workbuddy/skills/invoice-mail-downloader
+```
+
+Windows PowerShell：
+
+```powershell
+git clone https://github.com/benttianbao/invoice-mail-downloader-skill.git "$env:USERPROFILE\.workbuddy\skills\invoice-mail-downloader"
 ```
 
 然后重启或重新加载 WorkBuddy Skills。
@@ -27,6 +43,12 @@ git clone https://github.com/benttianbao/invoice-mail-downloader-skill.git ~/.wo
 ### 其他 Agent
 
 将本仓库克隆到该 Agent 的 Skills 目录，确保它能够读取根目录的 `SKILL.md`，并允许在用户确认后执行本地 Python 命令。
+
+也可以直接对支持 GitHub Skill 安装的 Agent 说：
+
+```text
+请从 https://github.com/benttianbao/invoice-mail-downloader-skill 安装 invoice-mail-downloader Skill。
+```
 
 ## 更新
 
