@@ -146,12 +146,20 @@ def load_config() -> dict[str, Any]:
 def load_state() -> dict[str, Any]:
     state = load_json(
         state_path(),
-        {"version": 4, "folders": {}, "files": {}, "provenance": {}, "invoice_formats": {}},
+        {
+            "version": 4,
+            "folders": {},
+            "files": {},
+            "provenance": {},
+            "invoice_formats": {},
+            "invoice_format_index_built": False,
+        },
     )
     state.setdefault("folders", {})
     state.setdefault("files", {})
     state.setdefault("provenance", {})
     state.setdefault("invoice_formats", {})
+    state.setdefault("invoice_format_index_built", False)
     state["version"] = 4
     return state
 
@@ -1536,11 +1544,30 @@ def scan_metadata(
 
 def rebuild_file_index(root: Path, state: dict[str, Any]) -> None:
     files = state.setdefault("files", {})
+    previously_recorded = {Path(value) for value in files.values()}
     if not root.exists():
         return
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() in {".pdf", ".ofd"}:
             files.setdefault(sha256_file(path), str(path))
+    if state.get("invoice_format_index_built"):
+        return
+
+    # 只迁移旧状态已登记的文件；不把用户手工放入根目录的文件纳入自动删除范围。
+    for path in previously_recorded:
+        if not path.exists() or path.suffix.lower() not in {".pdf", ".ofd"}:
+            continue
+        try:
+            text = pdf_text(path) if path.suffix.lower() == ".pdf" else ofd_text(path)
+        except Exception:
+            continue
+        invoice_key = invoice_identity(text, path.name)
+        if invoice_key:
+            state.setdefault("invoice_formats", {}).setdefault(invoice_key, {})[path.suffix.lower().lstrip(".")] = str(path)
+    for invoice_key, formats in list(state.setdefault("invoice_formats", {}).items()):
+        if formats.get("pdf") and formats.get("ofd"):
+            remove_recorded_ofd(state, invoice_key, root)
+    state["invoice_format_index_built"] = True
 
 
 def cmd_run(args: argparse.Namespace) -> int:
