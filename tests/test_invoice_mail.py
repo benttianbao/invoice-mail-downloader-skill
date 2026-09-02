@@ -75,6 +75,13 @@ class InvoiceMailTests(unittest.TestCase):
         html = '<a href="https://example.com/a">退订</a><a href="https://example.com/b">下载发票</a>'
         self.assertEqual(invoice_mail.extract_candidate_links("", html), ["https://example.com/b"])
 
+    def test_candidate_links_include_known_provider_page_in_invoice_message(self) -> None:
+        html = '<a href="https://nnfp.jss.com.cn/opaque-token">点击查看</a>'
+        self.assertEqual(
+            invoice_mail.extract_candidate_links("", html, True),
+            ["https://nnfp.jss.com.cn/opaque-token"],
+        )
+
     def test_candidate_links_exclude_mailto_and_non_invoice_documents(self) -> None:
         html = (
             '<a href="mailto:invoice@example.com">发票邮箱</a>'
@@ -145,7 +152,11 @@ class InvoiceMailTests(unittest.TestCase):
 
     def test_redact_url(self) -> None:
         value = invoice_mail.redact_url("https://example.com/download/a.pdf?token=secret#part")
-        self.assertEqual(value, "https://example.com/download/a.pdf")
+        self.assertEqual(value, "https://example.com/<已脱敏>.pdf")
+
+    def test_extract_seller_from_forwarded_invoice_subject(self) -> None:
+        text = "转发：您收到一张【宁波桂君初起餐饮管理有限公司】开具的发票【发票号码: 12345678】"
+        self.assertEqual(invoice_mail.extract_invoice_fields(text)["seller"], "宁波桂君初起餐饮管理有限公司")
 
     def test_ofd_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -184,6 +195,42 @@ class InvoiceMailTests(unittest.TestCase):
             result = invoice_mail.process_file(path, path.name, root / "out", {"files": {}}, root)
             self.assertEqual(result[0][0], "incomplete")
             self.assertIn("50 MB", result[0][2])
+
+    def test_trusted_provider_pdf_is_preserved_when_text_classifier_cannot_confirm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            path = root / "provider.pdf"
+            path.write_bytes(b"%PDF-1.4\n%%EOF")
+            state = {"files": {}, "provenance": {}, "invoice_formats": {}}
+            with mock.patch.object(invoice_mail, "pdf_text", return_value="无法识别的票面文本"):
+                result = invoice_mail.process_file(
+                    path,
+                    path.name,
+                    root / "out",
+                    state,
+                    root,
+                    {"source_type": "link", "uid": 2049},
+                    trusted_invoice_source=True,
+                )
+            self.assertEqual(result[0][0], "success")
+            self.assertTrue(Path(result[0][2].split("；", 1)[0]).exists())
+
+    def test_existing_file_is_relocated_when_metadata_becomes_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name) / "Invoices"
+            old = root / "待确认" / "未知日期_未知销售方_¥未知金额.pdf"
+            old.parent.mkdir(parents=True)
+            old.write_bytes(b"%PDF-1.4\n%%EOF")
+            digest = invoice_mail.sha256_file(old)
+            state = {"files": {digest: str(old)}, "provenance": {}, "invoice_formats": {}}
+            status, destination, missing = invoice_mail.archive_invoice(
+                old, ".pdf", root, state, INVOICE_TEXT
+            )
+            self.assertEqual(status, "skipped")
+            self.assertEqual(missing, [])
+            self.assertFalse(old.exists())
+            self.assertTrue(Path(destination).exists())
+            self.assertIn("/2026/09-02/", destination)
 
     def test_same_invoice_prefers_pdf_over_ofd(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -327,6 +374,36 @@ class InvoiceMailTests(unittest.TestCase):
         unresolved = invoice_mail.requeue_missing_archives(state)
         self.assertEqual(unresolved, [])
         self.assertEqual(state["folders"]["user@qq.com::INBOX"]["pending_uids"], [41, 42])
+        self.assertEqual(state["invoice_formats"]["number:1"], {})
+
+    def test_missing_archive_without_source_is_pruned(self) -> None:
+        missing = Path("/tmp/removed-legacy-invoice.pdf")
+        state = {
+            "files": {"digest": str(missing)},
+            "provenance": {},
+            "folders": {},
+            "invoice_formats": {"number:1": {"pdf": str(missing)}},
+        }
+        self.assertEqual(invoice_mail.requeue_missing_archives(state), [])
+        self.assertNotIn("digest", state["files"])
+        self.assertEqual(state["invoice_formats"]["number:1"], {})
+
+    def test_repair_state_discards_pending_and_prunes_missing_without_moving_cursor(self) -> None:
+        missing = Path("/tmp/removed-repair-invoice.pdf")
+        state = {
+            "files": {"digest": str(missing)},
+            "provenance": {"digest": {"uid": 9}},
+            "folders": {
+                "user@qq.com::INBOX": {"last_uid": 7754, "pending_uids": [1, 2, 3]},
+                "other@qq.com::INBOX": {"last_uid": 10, "pending_uids": [4]},
+            },
+            "invoice_formats": {"number:1": {"pdf": str(missing)}},
+        }
+        result = invoice_mail.repair_state(state, "user@qq.com")
+        self.assertEqual(result, {"discarded_pending_uids": 3, "pruned_missing_archives": 1})
+        self.assertEqual(state["folders"]["user@qq.com::INBOX"]["pending_uids"], [])
+        self.assertEqual(state["folders"]["user@qq.com::INBOX"]["last_uid"], 7754)
+        self.assertEqual(state["folders"]["other@qq.com::INBOX"]["pending_uids"], [4])
         self.assertEqual(state["invoice_formats"]["number:1"], {})
 
     def test_moved_archive_is_relocated_by_hash_without_retry(self) -> None:
@@ -507,6 +584,7 @@ class InvoiceMailTests(unittest.TestCase):
         self.assertEqual(metadata["mode"], "date_range_rescan")
         self.assertFalse(metadata["last_uid_advanced"])
         self.assertTrue(metadata["pending_uids_updated"])
+        self.assertEqual(metadata["pending_scope"], "current_date_range_only")
 
     def test_163_identity_is_sent(self) -> None:
         client = mock.Mock()
@@ -620,7 +698,7 @@ class InvoiceMailTests(unittest.TestCase):
         folder_state = state["folders"]["user@qq.com::INBOX"]
         self.assertEqual(folder_state["last_uid"], 100)
         self.assertTrue(folder_state["initialized"])
-        self.assertEqual(folder_state["pending_uids"], [30])
+        self.assertEqual(folder_state["pending_uids"], [])
 
     def test_uidvalidity_change_resets_cursor_before_initial_scan(self) -> None:
         client = mock.MagicMock()

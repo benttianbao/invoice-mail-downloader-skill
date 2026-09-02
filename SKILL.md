@@ -127,7 +127,7 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" run
 
 之后按每个邮箱文件夹的 UID 游标连续增量扫描，不使用日期窗口；中断较长时间也不会产生时间缺口。
 
-用户指定日期范围时执行强制重扫，不受 UID 游标限制，也不修改日常 `last_uid`；命中邮件的 `pending_uids` 重试状态仍会按本次结果更新：
+用户指定日期范围时执行独立强制重扫，不受 UID 游标限制，也不修改日常 `last_uid`。候选邮件必须完全来自本次 IMAP 日期查询，禁止合并此前的 `pending_uids`；本次失败时只保留本日期范围内的 UID：
 
 ```text
 python3 "<SKILL_DIR>/scripts/run_skill.py" run --account user@163.com --from-date 2026-08-01 --to-date 2026-08-31
@@ -164,7 +164,8 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" trust-domain fapiao.example.com --con
 - 每个附件独立判断是否为发票；同一封候选邮件中的合同、汇款申请书等非发票 PDF 会跳过。
 - PDF 先按页面布局提取，再使用普通文本提取降级；铁路电子客票使用独立字段规则。
 - 状态按邮件逐条保存，并记录文件哈希对应的邮箱、文件夹、UID、主题、原附件名或脱敏链接，便于追溯。
-- 每次运行先核对已登记的归档文件：文件在根目录内被移动时按哈希更新路径；文件确实缺失时，将其来源邮件 UID 自动加入待重试队列，由普通增量扫描补下载。
+- 普通增量运行会核对已登记的归档文件：文件在根目录内被移动时按哈希更新路径；文件确实缺失且具有完整来源时，将其 UID 加入增量待重试队列。指定日期或“从现在开始”运行不得继承这类历史队列；旧版本中无法追溯来源的失效索引直接清除。
+- 已知可信发票平台返回的 PDF 即使文字层无法确认票面，也必须保留到 `待确认/` 并报告缺失字段，不能作为普通文件跳过后清除邮件 UID。
 - 具体下载、重试、解压和大小限制以脚本为唯一事实来源，不在本文件重复维护。
 
 向用户概括脚本 JSON 中的：成功、跳过、未完成、错误、邮件主题、发件人、归档路径和错误码。不得展示邮件正文、授权码或带查询参数的完整 URL。
@@ -183,11 +184,10 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" trust-domain fapiao.example.com --con
 - `UNTRUSTED_DOMAIN`：报告已脱敏域名，等待用户决定是否加入可信列表。
 - `RUN_LOCKED`：锁内 PID 仍存活，等待现有任务结束；失效 PID 的锁会自动回收，不需要用户手动删除。
 - `FOLDER_SELECT_FAILED`：报告解码后的文件夹名称，继续其他文件夹。
-- `UIDVALIDITY_MISSING`：服务器没有返回安全维护增量游标所需的标识；跳过该文件夹并报告，不得在缺少该标识时猜测或推进游标。
+- `UIDVALIDITY_MISSING`：服务器没有返回安全维护增量游标所需的标识；跳过该文件夹且不得猜测或推进游标。指定日期运行记为跳过项，增量运行记为错误。
 - `IMAP_COMMAND_TIMEOUT`：单封邮件或命令超时；已逐条保存进度并保留 UID，下一次运行继续重试。
 - `MESSAGE_TOO_LARGE`：邮件超过安全上限，保留为未完成，不下载整封邮件。
 - `PDF_TEXT_EXTRACTION_FAILED`：PDF 文本层异常且布局提取也失败；保留为未完成，不把字段全部静默改为未知。
-- `ARCHIVE_MISSING_SOURCE_UNAVAILABLE`：归档文件已丢失，但旧状态没有邮箱文件夹或 UID，无法自动回补；需用日期范围重扫原邮件。
 - `DOWNLOAD_*`：保留失败项并继续；认证、验证码或动态网页由用户另行处理。
 - `DOWNLOAD_PROVIDER_RESPONSE_*`：已知发票平台的只读接口响应过大、结构异常或未返回 HTTPS PDF；保留待重试并报告，不执行页面脚本兜底。
 
@@ -200,6 +200,7 @@ accounts
 enable --email user@qq.com
 disable --email user@qq.com
 remove-account --email user@qq.com
+repair-state --account user@qq.com --confirm
 set-root "/absolute/path/Invoices" --confirm
 trusted-domains
 trust-domain example.com --confirm
@@ -207,3 +208,5 @@ untrust-domain example.com --confirm
 ```
 
 删除账号会删除账号配置并尝试删除对应系统凭据，不删除已归档发票。
+
+`repair-state` 仅在用户明确要求放弃未完成扫描或清理失效索引后使用：它清空指定账号的 `pending_uids`、删除磁盘上已不存在的文件索引，但保留 `last_uid`，因此不会重新开始被放弃的扫描。

@@ -49,6 +49,7 @@ MAX_MESSAGE_BYTES = 70 * 1024 * 1024
 IMAP_TIMEOUT_SECONDS = 20
 KEYWORDS = ("发票", "电子票", "开票", "票据", "invoice", "e-invoice", "einvoice")
 SUPPORTED_SUFFIXES = {".pdf", ".ofd", ".zip"}
+KNOWN_PROVIDER_PAGE_HOSTS = {"nnfp.jss.com.cn", "pis.baiwang.com"}
 PROVIDERS = {
     "163": {"domain": "163.com", "imap": "imap.163.com", "port": 993},
     "qq": {"domain": "qq.com", "imap": "imap.qq.com", "port": 993},
@@ -299,7 +300,12 @@ def extract_candidate_links(plain: str, html: str, message_is_candidate: bool = 
         suffix = Path(parts.path).suffix.lower()
         if suffix and suffix not in SUPPORTED_SUFFIXES:
             continue
-        if has_invoice_keyword(label + " " + url) or (message_is_candidate and suffix in SUPPORTED_SUFFIXES):
+        host = (parts.hostname or "").lower()
+        if (
+            has_invoice_keyword(label + " " + url)
+            or (message_is_candidate and suffix in SUPPORTED_SUFFIXES)
+            or (message_is_candidate and host in KNOWN_PROVIDER_PAGE_HOSTS)
+        ):
             candidates.append(url)
 
     url_re = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
@@ -430,7 +436,9 @@ def message_content(message: Message) -> tuple[str, str, list[tuple[str, bytes]]
 def redact_url(url: str) -> str:
     try:
         parts = urllib.parse.urlsplit(url)
-        return urllib.parse.urlunsplit((parts.scheme, parts.hostname or "", parts.path, "", ""))
+        suffix = Path(parts.path).suffix.lower()
+        marker = f"/<已脱敏>{suffix}" if suffix in SUPPORTED_SUFFIXES else "/<已脱敏>"
+        return urllib.parse.urlunsplit((parts.scheme, parts.hostname or "", marker, "", ""))
     except ValueError:
         return "<无效链接>"
 
@@ -643,6 +651,7 @@ def extract_invoice_fields(text: str) -> dict[str, str]:
                 date_value = dt.date(*map(int, match.groups())).isoformat()
 
     seller_patterns = (
+        r"收到一张【([^】]{2,80})】开具",
         r"销售方(?:信息)?\s*(?:名称)?\s*[：:]?\s*([^：:]{2,80}?)(?=\s*(?:统一社会信用代码|纳税人识别号|地址|开户行|购买方|发票))",
         r"销方名称\s*[：:]?\s*([^：:]{2,80}?)(?=\s*(?:统一社会信用代码|纳税人识别号|地址|开户行|$))",
     )
@@ -759,13 +768,6 @@ def archive_invoice(
     amount_label = fields["amount"] or "未知金额"
     filename = f"{date_label}_{seller_label}_¥{amount_label}{suffix}"
 
-    digest = sha256_file(source)
-    existing = state.setdefault("files", {}).get(digest)
-    if existing and Path(existing).exists():
-        if provenance:
-            state.setdefault("provenance", {})[digest] = provenance
-        return "skipped", existing, missing
-
     if missing:
         destination_dir = root / "待确认"
     else:
@@ -773,6 +775,27 @@ def archive_invoice(
         destination_dir = root / f"{parsed_date.year:04d}" / f"{parsed_date.month:02d}-{parsed_date.day:02d}"
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / filename
+
+    digest = sha256_file(source)
+    existing = state.setdefault("files", {}).get(digest)
+    if existing and Path(existing).exists():
+        existing_path = Path(existing)
+        if existing_path != destination and not destination.exists():
+            try:
+                existing_path.resolve().relative_to(root.resolve())
+                existing_path.replace(destination)
+                for formats in state.setdefault("invoice_formats", {}).values():
+                    for format_name, value in list(formats.items()):
+                        if Path(value) == existing_path:
+                            formats[format_name] = str(destination)
+                existing = str(destination)
+                state["files"][digest] = existing
+            except (OSError, ValueError):
+                pass
+        if provenance:
+            state.setdefault("provenance", {})[digest] = provenance
+        return "skipped", existing, missing
+
     if destination.exists():
         if sha256_file(destination) == digest:
             state["files"][digest] = str(destination)
@@ -954,6 +977,7 @@ def process_file(
     temp_dir: Path,
     provenance: dict[str, Any] | None = None,
     seen_pdf_keys: set[str] | None = None,
+    trusted_invoice_source: bool = False,
 ) -> list[tuple[str, str, str]]:
     if seen_pdf_keys is None:
         seen_pdf_keys = set()
@@ -974,22 +998,37 @@ def process_file(
             child_provenance = dict(provenance or {})
             child_provenance.update({"container": hinted_name, "member": member_name})
             results.extend(
-                process_file(extracted_file, member_name, root, state, temp_dir, child_provenance, seen_pdf_keys)
+                process_file(
+                    extracted_file,
+                    member_name,
+                    root,
+                    state,
+                    temp_dir,
+                    child_provenance,
+                    seen_pdf_keys,
+                    trusted_invoice_source,
+                )
             )
         return results
+    extraction_warning = ""
     try:
         text = pdf_text(path) if suffix == ".pdf" else ofd_text(path)
     except Exception as exc:
-        return [("incomplete", hinted_name, str(exc))]
-    if not is_invoice_document(text, hinted_name):
+        if not trusted_invoice_source:
+            return [("incomplete", hinted_name, str(exc))]
+        text = ""
+        extraction_warning = f"；可信发票平台文件已保留，但文字提取失败：{error_code(exc, 'PDF_TEXT_EXTRACTION_FAILED')}"
+    trusted_context = str((provenance or {}).get("subject", "")) if trusted_invoice_source else ""
+    invoice_text = f"{text}\n{trusted_context}".strip()
+    if not is_invoice_document(invoice_text, hinted_name) and not trusted_invoice_source:
         return [("skipped", hinted_name, "附件内容不是可识别的发票，未归档")]
-    invoice_key = invoice_identity(text, hinted_name)
+    invoice_key = invoice_identity(invoice_text, hinted_name)
     if suffix == ".ofd" and invoice_key:
         existing_pdf = recorded_format_path(state, invoice_key, ".pdf")
         if invoice_key in seen_pdf_keys or existing_pdf is not None:
             detail = str(existing_pdf) if existing_pdf is not None else "本批次已处理同一发票的 PDF"
             return [("skipped", hinted_name, f"同一发票已有 PDF，未保留 OFD；{detail}")]
-    status, destination, missing = archive_invoice(path, suffix, root, state, text, provenance)
+    status, destination, missing = archive_invoice(path, suffix, root, state, invoice_text, provenance)
     removed_ofd = ""
     if invoice_key:
         formats = state.setdefault("invoice_formats", {}).setdefault(invoice_key, {})
@@ -1000,6 +1039,7 @@ def process_file(
     detail = destination
     if missing:
         detail += "；待确认字段：" + "、".join(missing)
+    detail += extraction_warning
     if removed_ofd:
         detail += f"；已移除同一发票的 OFD：{removed_ofd}"
     return [(status, hinted_name, detail)]
@@ -1090,7 +1130,14 @@ def process_message(
                                     }
                                 )
                                 for status, _source, detail in process_file(
-                                    child_target, child_name, root, state, message_tmp, provenance, seen_pdf_keys
+                                    child_target,
+                                    child_name,
+                                    root,
+                                    state,
+                                    message_tmp,
+                                    provenance,
+                                    seen_pdf_keys,
+                                    True,
                                 ):
                                     items.append(report_item(status, child_source, subject, sender, detail))
                             except Exception as exc:
@@ -1199,8 +1246,14 @@ def run_account_once(
             )
             uidvalidity = folder_uidvalidity(client, wire_name)
             if uidvalidity is None:
+                item_status = "skipped" if explicit_range else "error"
+                detail = (
+                    "服务器未返回 UIDVALIDITY；指定日期运行已安全跳过该文件夹"
+                    if explicit_range
+                    else "服务器未返回 UIDVALIDITY"
+                )
                 output.append(
-                    report_item("error", f"文件夹:{display_name}", "", email, "服务器未返回 UIDVALIDITY", "UIDVALIDITY_MISSING")
+                    report_item(item_status, f"文件夹:{display_name}", "", email, detail, "UIDVALIDITY_MISSING")
                 )
                 continue
             if folder_state.get("uidvalidity") != uidvalidity:
@@ -1222,7 +1275,8 @@ def run_account_once(
                     continue
                 if explicit_range:
                     uids = search_date_uids(client, from_date, to_date)
-                    pending = set(previous_pending) | set(uids)
+                    # 指定日期范围是一次独立扫描：不得把任何历史待处理 UID 混入本次候选。
+                    pending: set[int] = set()
                     if folder_state.get("initialized", False):
                         checkpoint = last_uid
                     else:
@@ -1641,6 +1695,7 @@ def scan_metadata(
             "to": str(to_date),
             "last_uid_advanced": initializing,
             "pending_uids_updated": True,
+            "pending_scope": "current_date_range_only",
         }
     return {
         "mode": "uid_incremental",
@@ -1757,17 +1812,45 @@ def requeue_missing_archives(state: dict[str, Any]) -> list[dict[str, str]]:
             pending.add(uid)
             folder_state["pending_uids"] = sorted(pending)
             continue
-        unresolved.append(
-            report_item(
-                "incomplete",
-                f"归档:{missing_path.name}",
-                str(provenance.get("subject", "")),
-                str(provenance.get("sender", "")),
-                "已登记的归档文件不存在，且旧状态缺少可重试的邮箱文件夹或 UID",
-                "ARCHIVE_MISSING_SOURCE_UNAVAILABLE",
-            )
-        )
+        # 旧版本没有记录来源的失效索引无法恢复；清除索引，避免每次运行重复报警。
+        state.setdefault("files", {}).pop(digest, None)
+        state.setdefault("provenance", {}).pop(digest, None)
     return unresolved
+
+
+def repair_state(state: dict[str, Any], account: str | None = None) -> dict[str, int]:
+    """丢弃未完成扫描队列并清理磁盘上已不存在的归档索引，不修改增量游标。"""
+    account_prefix = f"{account.lower()}::" if account else ""
+    discarded_pending = 0
+    for key, folder_state in state.setdefault("folders", {}).items():
+        if account_prefix and not key.lower().startswith(account_prefix):
+            continue
+        pending = folder_state.get("pending_uids", [])
+        discarded_pending += len(pending)
+        folder_state["pending_uids"] = []
+
+    missing_digests = [
+        digest for digest, value in state.setdefault("files", {}).items() if not Path(value).exists()
+    ]
+    missing_paths = {Path(state["files"][digest]) for digest in missing_digests}
+    for digest in missing_digests:
+        state["files"].pop(digest, None)
+        state.setdefault("provenance", {}).pop(digest, None)
+    for formats in state.setdefault("invoice_formats", {}).values():
+        for format_name, value in list(formats.items()):
+            if Path(value) in missing_paths:
+                formats.pop(format_name, None)
+    return {"discarded_pending_uids": discarded_pending, "pruned_missing_archives": len(missing_digests)}
+
+
+def cmd_repair_state(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        raise SkillError("CONFIRMATION_REQUIRED", "丢弃待处理扫描和清理失效索引需要用户确认后添加 --confirm")
+    state = load_state()
+    result = repair_state(state, args.account)
+    atomic_json_write(state_path(), state)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1811,7 +1894,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     state = load_state()
     rebuild_file_index(root, state)
     rebuild_invoice_identity_index(root, state)
-    results = requeue_missing_archives(state)
+    # 日期范围和“从现在开始”模式不得继承历史待处理扫描。
+    results = [] if explicit_range or start_from_now else requeue_missing_archives(state)
     with exclusive_run_lock(), tempfile.TemporaryDirectory(prefix="invoice-mail-") as temp_name:
         temp_dir = Path(temp_name)
         for account in accounts:
@@ -1888,6 +1972,11 @@ def build_parser() -> argparse.ArgumentParser:
     remove = subparsers.add_parser("remove-account", help="删除邮箱账号配置和凭据")
     remove.add_argument("--email", required=True)
     remove.set_defaults(handler=cmd_remove)
+
+    repair = subparsers.add_parser("repair-state", help="丢弃未完成扫描并清理失效归档索引")
+    repair.add_argument("--account", help="只清理指定邮箱的待处理 UID；失效归档索引始终全局清理")
+    repair.add_argument("--confirm", action="store_true", help="确认丢弃待处理扫描和失效索引")
+    repair.set_defaults(handler=cmd_repair_state)
 
     run = subparsers.add_parser("run", help="执行一次扫描、下载和归档")
     run.add_argument("--account", help="只运行指定邮箱")
