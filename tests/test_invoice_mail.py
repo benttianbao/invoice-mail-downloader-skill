@@ -18,6 +18,7 @@ SPEC.loader.exec_module(invoice_mail)
 
 INVOICE_TEXT = (
     "电子发票 发票号码：12345678901234567890 开票日期：2026年09月02日 "
+    "购买方信息 名称：永赢金融租赁有限公司 统一社会信用代码/纳税人识别号：91330200316986507A "
     "销售方名称：测试公司 统一社会信用代码 1 价税合计（小写）：￥128.00"
 )
 
@@ -58,6 +59,57 @@ class InvoiceMailTests(unittest.TestCase):
             invoice_mail.extract_invoice_fields(text),
             {"date": "2026-09-01", "seller": "中国铁路", "amount": "26.00"},
         )
+
+    def test_buyer_identity_matches_required_company(self) -> None:
+        text = (
+            "电子发票（普通发票） 购买方信息 "
+            "名称：永赢金融租赁有限公司 名称：销售方公司 "
+            "统一社会信用代码/纳税人识别号：91330200316986507A "
+            "统一社会信用代码/纳税人识别号：91330100123456789X"
+        )
+        self.assertEqual(
+            invoice_mail.extract_buyer_fields(text),
+            {"name": "永赢金融租赁有限公司", "tax_id": "91330200316986507A"},
+        )
+        self.assertEqual(invoice_mail.buyer_validation_issues(text), [])
+
+    def test_buyer_identity_mismatch_requires_confirmation(self) -> None:
+        text = (
+            "电子发票 购买方信息 名称：其他公司 "
+            "统一社会信用代码/纳税人识别号：91330100123456789X 销售方信息"
+        )
+        self.assertEqual(
+            invoice_mail.buyer_validation_issues(text),
+            ["购买方名称不匹配", "购买方纳税人识别号不匹配"],
+        )
+
+    def test_buyer_identity_handles_detached_two_column_values(self) -> None:
+        text = (
+            "电子发票 买 名称： 售 名称： "
+            "统一社会信用代码/纳税人识别号： 统一社会信用代码/纳税人识别号： "
+            "永赢金融租赁有限公司 销售方公司 "
+            "91330200316986507A 91330100123456789X"
+        )
+        self.assertEqual(
+            invoice_mail.extract_buyer_fields(text),
+            {"name": "永赢金融租赁有限公司", "tax_id": "91330200316986507A"},
+        )
+        self.assertEqual(invoice_mail.buyer_validation_issues(text), [])
+
+    def test_required_company_on_seller_side_does_not_pass_buyer_validation(self) -> None:
+        text = (
+            "电子发票 名称：其他公司 名称：永赢金融租赁有限公司 "
+            "统一社会信用代码/纳税人识别号：91330100123456789X "
+            "统一社会信用代码/纳税人识别号：91330200316986507A"
+        )
+        self.assertEqual(
+            invoice_mail.buyer_validation_issues(text),
+            ["购买方名称不匹配", "购买方纳税人识别号不匹配"],
+        )
+
+    def test_railway_ticket_is_exempt_from_buyer_validation(self) -> None:
+        text = "电子发票（铁路电子客票） 开票日期：2026年09月01日 票价：￥26.00"
+        self.assertEqual(invoice_mail.buyer_validation_issues(text), [])
 
     def test_bank_transfer_form_is_not_invoice(self) -> None:
         text = "境外汇款申请书 APPLICATION FOR FUNDS TRANSFERS 本笔款项是否为报税货物项下付款 发票号"
@@ -230,7 +282,24 @@ class InvoiceMailTests(unittest.TestCase):
             self.assertEqual(missing, [])
             self.assertFalse(old.exists())
             self.assertTrue(Path(destination).exists())
-            self.assertIn("/2026/09-02/", destination)
+            self.assertEqual(Path(destination).parts[-3:-1], ("2026", "09-02"))
+
+    def test_mismatched_buyer_is_archived_for_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            path = root / "invoice.pdf"
+            path.write_bytes(b"%PDF-1.4\n%%EOF")
+            text = (
+                "电子发票 开票日期：2026年09月02日 "
+                "购买方信息 名称：其他公司 纳税人识别号：91330100123456789X "
+                "销售方名称：测试公司 统一社会信用代码 1 价税合计（小写）：￥128.00"
+            )
+            with mock.patch.object(invoice_mail, "pdf_text", return_value=text):
+                result = invoice_mail.process_file(path, path.name, root / "out", {"files": {}}, root)
+            self.assertEqual(result[0][0], "success")
+            self.assertIn("待确认", Path(result[0][2].split("；", 1)[0]).parts)
+            self.assertIn("购买方名称不匹配", result[0][2])
+            self.assertIn("购买方纳税人识别号不匹配", result[0][2])
 
     def test_same_invoice_prefers_pdf_over_ofd(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -437,7 +506,12 @@ class InvoiceMailTests(unittest.TestCase):
             with mock.patch.object(
                 invoice_mail,
                 "pdf_text",
-                return_value="电子发票 开票日期：2026年09月02日 销售方名称：测试公司 统一社会信用代码 1 价税合计（小写）：￥1.00",
+                return_value=(
+                    "电子发票 开票日期：2026年09月02日 "
+                    "购买方信息 名称：永赢金融租赁有限公司 "
+                    "统一社会信用代码/纳税人识别号：91330200316986507A "
+                    "销售方名称：测试公司 统一社会信用代码 1 价税合计（小写）：￥1.00"
+                ),
             ):
                 items, incomplete = invoice_mail.process_message(
                     message.as_bytes(),
@@ -448,7 +522,7 @@ class InvoiceMailTests(unittest.TestCase):
                 )
             self.assertFalse(incomplete)
             self.assertEqual(items[0]["status"], "success")
-            self.assertIn("2026/09-02", items[0]["detail"])
+            self.assertEqual(Path(items[0]["detail"]).parts[-3:-1], ("2026", "09-02"))
             provenance = next(iter(state["provenance"].values()))
             self.assertEqual(provenance["uid"], 12)
             self.assertEqual(provenance["original_filename"], "invoice.pdf")

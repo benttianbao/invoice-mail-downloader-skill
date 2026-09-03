@@ -50,6 +50,8 @@ IMAP_TIMEOUT_SECONDS = 20
 KEYWORDS = ("发票", "电子票", "开票", "票据", "invoice", "e-invoice", "einvoice")
 SUPPORTED_SUFFIXES = {".pdf", ".ofd", ".zip"}
 KNOWN_PROVIDER_PAGE_HOSTS = {"nnfp.jss.com.cn", "pis.baiwang.com"}
+REQUIRED_BUYER_NAME = "永赢金融租赁有限公司"
+REQUIRED_BUYER_TAX_ID = "91330200316986507A"
 PROVIDERS = {
     "163": {"domain": "163.com", "imap": "imap.163.com", "port": 993},
     "qq": {"domain": "qq.com", "imap": "imap.qq.com", "port": 993},
@@ -695,6 +697,77 @@ def extract_invoice_fields(text: str) -> dict[str, str]:
     return {"date": date_value, "seller": seller, "amount": amount}
 
 
+def extract_buyer_fields(text: str) -> dict[str, str]:
+    """提取票面上位于购买方一侧的名称和纳税人识别号。"""
+    flat = normalize_text(text)
+    compact = re.sub(r"\s+", "", flat)
+    name = ""
+    tax_id = ""
+
+    name_label = r"(?:购\s*方\s*名\s*称|名\s*称)"
+    next_label = (
+        r"(?:名\s*称|统\s*一\s*社\s*会\s*信\s*用\s*代\s*码|"
+        r"纳\s*税\s*人\s*识\s*别\s*号|地\s*址|开\s*户\s*行|"
+        r"销\s*售\s*方|价\s*税\s*合\s*计)"
+    )
+    name_pattern = rf"{name_label}\s*[：:]\s*(.{{2,80}}?)(?=\s*{next_label}\s*[：:]?|$)"
+    if match := re.search(name_pattern, flat, re.I):
+        name = normalize_text(match.group(1))
+
+    tax_label = (
+        r"(?:统\s*一\s*社\s*会\s*信\s*用\s*代\s*码"
+        r"(?:\s*/\s*纳\s*税\s*人\s*识\s*别\s*号)?|"
+        r"纳\s*税\s*人\s*识\s*别\s*号|购\s*方\s*税\s*号)"
+    )
+    tax_pattern = rf"{tax_label}\s*[：:]?\s*([0-9A-Z](?:\s*[0-9A-Z]){{14,19}})"
+    if match := re.search(tax_pattern, flat.upper()):
+        tax_id = re.sub(r"[^0-9A-Z]", "", match.group(1).upper())
+
+    # 数电发票的双栏文字层可能先输出两侧标签、再输出两侧值。
+    # 此时用票面中第一个独立 18 位身份代码作为购买方代码；20 位发票号码不会误入。
+    identity_codes = [
+        re.sub(r"[^0-9A-Z]", "", value)
+        for value in re.findall(
+            r"(?<![0-9A-Z])([0-9A-Z](?:[ \t]*[0-9A-Z]){17})(?![0-9A-Z])",
+            flat.upper(),
+        )
+    ]
+    if identity_codes:
+        tax_id = identity_codes[0]
+
+    # 仅当购买方代码已经精确匹配时，才跨双栏文字层确认目标名称，
+    # 避免目标公司仅出现在销售方一侧时产生误判。
+    if tax_id == REQUIRED_BUYER_TAX_ID and re.sub(r"\s+", "", REQUIRED_BUYER_NAME) in compact:
+        name = REQUIRED_BUYER_NAME
+
+    return {"name": name, "tax_id": tax_id}
+
+
+def is_railway_ticket(text: str) -> bool:
+    compact = re.sub(r"\s+", "", normalize_text(text))
+    return "铁路电子客票" in compact or ("中国铁路" in compact and "电子客票" in compact)
+
+
+def buyer_validation_issues(text: str) -> list[str]:
+    """返回购买方校验问题；铁路电子客票按业务规则豁免。"""
+    if is_railway_ticket(text):
+        return []
+    buyer = extract_buyer_fields(text)
+    actual_name = re.sub(r"\s+", "", buyer["name"])
+    expected_name = re.sub(r"\s+", "", REQUIRED_BUYER_NAME)
+    actual_tax_id = re.sub(r"[^0-9A-Z]", "", buyer["tax_id"].upper())
+    issues: list[str] = []
+    if not actual_name:
+        issues.append("购买方名称缺失")
+    elif actual_name != expected_name:
+        issues.append("购买方名称不匹配")
+    if not actual_tax_id:
+        issues.append("购买方纳税人识别号缺失")
+    elif actual_tax_id != REQUIRED_BUYER_TAX_ID:
+        issues.append("购买方纳税人识别号不匹配")
+    return issues
+
+
 def invoice_identity(text: str, filename: str = "") -> str:
     """提取可用于跨格式去重的可靠票号；无法可靠识别时返回空字符串。"""
     flat = normalize_text(text)
@@ -762,13 +835,14 @@ def archive_invoice(
     if text is None:
         text = pdf_text(source) if suffix == ".pdf" else ofd_text(source)
     fields = extract_invoice_fields(text)
-    missing = [key for key in ("date", "seller", "amount") if not fields[key]]
+    review_reasons = [key for key in ("date", "seller", "amount") if not fields[key]]
+    review_reasons.extend(buyer_validation_issues(text))
     date_label = fields["date"] or "未知日期"
     seller_label = safe_component(fields["seller"], "未知销售方")
     amount_label = fields["amount"] or "未知金额"
     filename = f"{date_label}_{seller_label}_¥{amount_label}{suffix}"
 
-    if missing:
+    if review_reasons:
         destination_dir = root / "待确认"
     else:
         parsed_date = dt.date.fromisoformat(fields["date"])
@@ -794,20 +868,20 @@ def archive_invoice(
                 pass
         if provenance:
             state.setdefault("provenance", {})[digest] = provenance
-        return "skipped", existing, missing
+        return "skipped", existing, review_reasons
 
     if destination.exists():
         if sha256_file(destination) == digest:
             state["files"][digest] = str(destination)
             if provenance:
                 state.setdefault("provenance", {})[digest] = provenance
-            return "skipped", str(destination), missing
+            return "skipped", str(destination), review_reasons
         destination = destination.with_name(f"{destination.stem}_{digest[:8]}{suffix}")
     shutil.copy2(source, destination)
     state["files"][digest] = str(destination)
     if provenance:
         state.setdefault("provenance", {})[digest] = provenance
-    return "success", str(destination), missing
+    return "success", str(destination), review_reasons
 
 
 def recorded_format_path(state: dict[str, Any], invoice_key: str, suffix: str) -> Path | None:
@@ -1028,7 +1102,7 @@ def process_file(
         if invoice_key in seen_pdf_keys or existing_pdf is not None:
             detail = str(existing_pdf) if existing_pdf is not None else "本批次已处理同一发票的 PDF"
             return [("skipped", hinted_name, f"同一发票已有 PDF，未保留 OFD；{detail}")]
-    status, destination, missing = archive_invoice(path, suffix, root, state, invoice_text, provenance)
+    status, destination, review_reasons = archive_invoice(path, suffix, root, state, invoice_text, provenance)
     removed_ofd = ""
     if invoice_key:
         formats = state.setdefault("invoice_formats", {}).setdefault(invoice_key, {})
@@ -1037,8 +1111,8 @@ def process_file(
             seen_pdf_keys.add(invoice_key)
             removed_ofd = remove_recorded_ofd(state, invoice_key, root)
     detail = destination
-    if missing:
-        detail += "；待确认字段：" + "、".join(missing)
+    if review_reasons:
+        detail += "；待确认原因：" + "、".join(review_reasons)
     detail += extraction_warning
     if removed_ofd:
         detail += f"；已移除同一发票的 OFD：{removed_ofd}"
