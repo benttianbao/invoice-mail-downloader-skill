@@ -1,6 +1,6 @@
 ---
 name: invoice-mail-downloader
-description: 从已配置的 163 邮箱或 QQ 邮箱中按需查找电子发票附件和可信下载链接，下载 PDF/OFD、解包 ZIP，并按日期命名归档。适用于用户明确要求“从邮箱下载发票”或“整理邮件里的电子发票”；不用于开票申请、填写税务信息、网页登录或后台定时监控。
+description: 从已配置的 163 邮箱或 QQ 邮箱中按需查找电子发票附件和可信下载链接，下载 PDF/OFD、解包 ZIP、按日期命名归档，并自动维护发票登记 Excel。适用于用户明确要求“从邮箱下载发票”或“整理邮件里的电子发票”；不用于开票申请、填写税务信息、网页登录或后台定时监控。
 license: MIT
 ---
 
@@ -21,6 +21,7 @@ license: MIT
 - 只访问用户已明确加入可信列表的公网 HTTPS 域名；不执行 JavaScript，也不点击网页按钮。
 - 对已知诺诺/JSS、百望预览页，仅调用其页面本身使用的只读详情或 PDF 下载接口；接口返回的新文件域名仍须用户单独加入可信列表。
 - 除铁路电子客票外，普通发票必须校验购买方名称为“永赢金融租赁有限公司”、纳税人识别号为 `91330200316986507A`。任一字段缺失或不匹配时不进入正式日期目录，而是保留到 `待确认/` 并报告原因；铁路电子客票豁免该校验。
+- 每次下载结束后在发票根目录生成或更新 `发票登记.xlsx`。重复扫描按发票号码去重，缺少可靠票号时按文件 SHA-256 去重；不得覆盖用户在人工字段中的内容。
 
 ## 定位技能目录
 
@@ -61,6 +62,8 @@ py -3 "<SKILL_DIR>/scripts/bootstrap.py"     # Windows
 ```text
 python3 "<SKILL_DIR>/scripts/run_skill.py" preflight
 ```
+
+Excel 登记功能使用 Codex 随附的 Node.js 与 `@oai/artifact-tool`。`preflight` 会同时检查该运行时；缺失时发票仍保留在归档目录，登记表同步会报告 `EXCEL_RUNTIME_MISSING`，待运行时恢复后执行 `sync-excel` 重试。
 
 ### 3. 通过本地安全页面配置账号
 
@@ -170,6 +173,23 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" trust-domain fapiao.example.com --con
 - 已知可信发票平台返回的 PDF 即使文字层无法确认票面，也必须保留到 `待确认/` 并报告缺失字段，不能作为普通文件跳过后清除邮件 UID。
 - 具体下载、重试、解压和大小限制以脚本为唯一事实来源，不在本文件重复维护。
 
+### 发票登记 Excel
+
+- 固定文件：`<发票根目录>/发票登记.xlsx`，工作表名为“发票登记”。
+- 列顺序：序号、发票日期、支付日期、收款姓名、发票金额、报销金额、费用类型、开票方、发票编号、发票下载时间、备注、校验状态。
+- 自动字段：序号、发票日期、发票金额、开票方、发票编号、发票下载时间、校验状态。
+- 人工字段：支付日期、收款姓名、报销金额、费用类型、备注。新记录的报销金额默认等于发票金额；后续同步保留人工修改。
+- 费用类型下拉值固定为：部门营销费用、企业文化费用、出差报销费用。
+- 正常发票显示“通过”；字段缺失、购买方校验失败或文字提取失败显示“待确认”及原因。铁路电子客票继续豁免购买方校验。
+- 首次升级或需要重建登记表时执行：
+
+```text
+python3 "<SKILL_DIR>/scripts/run_skill.py" sync-excel   # macOS
+py -3 "<SKILL_DIR>/scripts/run_skill.py" sync-excel   # Windows
+```
+
+该命令只扫描当前发票根目录中已登记的 PDF/OFD，不连接邮箱；历史文件的首次下载时间以文件修改时间回填。若登记表正被 Excel 占用，不覆盖现有文件，报告错误并在下次运行重试。
+
 向用户概括脚本 JSON 中的：成功、跳过、未完成、错误、邮件主题、发件人、归档路径和错误码。不得展示邮件正文、授权码或带查询参数的完整 URL。
 
 ## 故障排查
@@ -190,6 +210,8 @@ python3 "<SKILL_DIR>/scripts/run_skill.py" trust-domain fapiao.example.com --con
 - `IMAP_COMMAND_TIMEOUT`：单封邮件或命令超时；已逐条保存进度并保留 UID，下一次运行继续重试。
 - `MESSAGE_TOO_LARGE`：邮件超过安全上限，保留为未完成，不下载整封邮件。
 - `PDF_TEXT_EXTRACTION_FAILED`：PDF 文本层异常且布局提取也失败；保留为未完成，不把字段全部静默改为未知。
+- `EXCEL_RUNTIME_MISSING`：缺少 Codex 电子表格运行时；发票归档不回滚，恢复运行时后执行 `sync-excel`。
+- `EXCEL_SYNC_FAILED`：登记表无法读取、正在被占用或导出失败；为保护人工字段不覆盖现有表，关闭 Excel 后执行 `sync-excel` 重试。
 - `DOWNLOAD_*`：保留失败项并继续；认证、验证码或动态网页由用户另行处理。
 - `DOWNLOAD_PROVIDER_RESPONSE_*`：已知发票平台的只读接口响应过大、结构异常或未返回 HTTPS PDF；保留待重试并报告，不执行页面脚本兜底。
 
@@ -203,6 +225,7 @@ enable --email user@qq.com
 disable --email user@qq.com
 remove-account --email user@qq.com
 repair-state --account user@qq.com --confirm
+sync-excel
 set-root "/absolute/path/Invoices" --confirm
 trusted-domains
 trust-domain example.com --confirm

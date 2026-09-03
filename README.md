@@ -1,6 +1,6 @@
 # Invoice Mail Downloader Skill
 
-一个跨 Codex、WorkBuddy 等支持 `SKILL.md` 的 AI Agent Skill：从已配置的 163 邮箱或 QQ 邮箱中按需查找电子发票附件和可信下载链接，下载 PDF/OFD、解包 ZIP，并按日期命名归档。同一发票优先保留 PDF，只有没有 PDF 时才保留 OFD。
+一个支持 `SKILL.md` 的 AI Agent Skill：从已配置的 163 邮箱或 QQ 邮箱中按需查找电子发票附件和可信下载链接，下载 PDF/OFD、解包 ZIP、按日期命名归档，并自动维护 `发票登记.xlsx`。同一发票优先保留 PDF，只有没有 PDF 时才保留 OFD。
 
 ## 安装
 
@@ -71,7 +71,17 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 - 识别常见 `dzfp_票号` 文件名，过滤邮件地址和 DOC/DOCX 说明链接，避免冗余 OFD及无效重试；
 - 支持通过诺诺/JSS、百望预览页使用的只读官方接口解析 PDF，同时继续要求最终文件域名逐个获得信任；
 - 可信发票平台返回的 PDF 即使文字识别失败也会保留到 `待确认/`，不会误判完成后丢弃；
+- 下载完成后自动维护发票登记表，按票号或文件哈希去重，并保留支付日期、收款姓名、报销金额、费用类型和备注等人工字段；
+- 自动填写发票日期、发票金额、开票方、发票编号、下载时间和校验状态；费用类型提供“部门营销费用、企业文化费用、出差报销费用”下拉选项；
 - 修改归档目录和增加可信下载域名都需要用户明确确认。
+
+首次升级后可在不连接邮箱的情况下补录现有归档：
+
+```bash
+python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" sync-excel
+```
+
+Windows 将 `python3` 替换为 `py -3`。Excel 功能依赖 Codex 随附的 `@oai/artifact-tool` 运行时，`preflight` 会检查其可用性。
 
 安装隔离依赖：
 
@@ -112,4 +122,4 @@ python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --s
 python -m unittest discover -s tests -v
 ```
 
-当前包含 52 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
+当前包含 62 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。

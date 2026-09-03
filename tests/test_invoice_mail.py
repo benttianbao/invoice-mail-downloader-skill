@@ -123,6 +123,55 @@ class InvoiceMailTests(unittest.TestCase):
         filename = "dzfp_26932000000718816621_销售方_20260507102101.ofd"
         self.assertEqual(invoice_mail.invoice_identity("发票号码：", filename), "number:26932000000718816621")
 
+    def test_extract_invoice_number_returns_plain_number_for_excel(self) -> None:
+        self.assertEqual(invoice_mail.extract_invoice_number(INVOICE_TEXT), "12345678901234567890")
+
+    def test_rebuild_invoice_records_backfills_and_preserves_first_download_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            path = root / "invoice.pdf"
+            path.write_bytes(b"%PDF-1.4\n%%EOF")
+            digest = invoice_mail.sha256_file(path)
+            state = {
+                "files": {digest: str(path)},
+                "provenance": {digest: {"original_filename": "invoice.pdf"}},
+                "invoice_records": {
+                    "number:12345678901234567890": {"downloaded_at": "2026-09-01T08:30:00+08:00"}
+                },
+            }
+            with mock.patch.object(invoice_mail, "pdf_text", return_value=INVOICE_TEXT):
+                records = invoice_mail.rebuild_invoice_records(root, state)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["invoice_date"], "2026-09-02")
+            self.assertEqual(records[0]["seller"], "测试公司")
+            self.assertEqual(records[0]["invoice_amount"], "128.00")
+            self.assertEqual(records[0]["invoice_number"], "12345678901234567890")
+            self.assertEqual(records[0]["downloaded_at"], "2026-09-01T08:30:00+08:00")
+            self.assertEqual(records[0]["validation_status"], "通过")
+
+    def test_rebuild_invoice_records_uses_sha_fallback_and_marks_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            path = root / "unknown.pdf"
+            path.write_bytes(b"%PDF-1.4\n%%EOF")
+            digest = invoice_mail.sha256_file(path)
+            state = {"files": {digest: str(path)}, "provenance": {}, "invoice_records": {}}
+            with mock.patch.object(invoice_mail, "pdf_text", return_value="电子发票"):
+                records = invoice_mail.rebuild_invoice_records(root, state)
+            self.assertEqual(records[0]["record_key"], f"sha256:{digest}")
+            self.assertEqual(records[0]["invoice_number"], "")
+            self.assertTrue(records[0]["validation_status"].startswith("待确认："))
+
+    def test_archived_filename_fields_backfill_only_generated_archive_names(self) -> None:
+        self.assertEqual(
+            invoice_mail.archived_filename_fields("2026-01-26_宁波桂君初起餐饮管理有限公司_¥497.42.pdf"),
+            {"date": "2026-01-26", "seller": "宁波桂君初起餐饮管理有限公司", "amount": "497.42"},
+        )
+        self.assertEqual(
+            invoice_mail.archived_filename_fields("原始发票497.42.pdf"),
+            {"date": "", "seller": "", "amount": ""},
+        )
+
     def test_candidate_links_require_context(self) -> None:
         html = '<a href="https://example.com/a">退订</a><a href="https://example.com/b">下载发票</a>'
         self.assertEqual(invoice_mail.extract_candidate_links("", html), ["https://example.com/b"])

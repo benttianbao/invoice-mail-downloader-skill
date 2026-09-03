@@ -27,6 +27,7 @@ import secrets
 import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -52,6 +53,7 @@ SUPPORTED_SUFFIXES = {".pdf", ".ofd", ".zip"}
 KNOWN_PROVIDER_PAGE_HOSTS = {"nnfp.jss.com.cn", "pis.baiwang.com"}
 REQUIRED_BUYER_NAME = "永赢金融租赁有限公司"
 REQUIRED_BUYER_TAX_ID = "91330200316986507A"
+INVOICE_REGISTER_FILENAME = "发票登记.xlsx"
 PROVIDERS = {
     "163": {"domain": "163.com", "imap": "imap.163.com", "port": 993},
     "qq": {"domain": "qq.com", "imap": "imap.qq.com", "port": 993},
@@ -151,11 +153,12 @@ def load_state() -> dict[str, Any]:
     state = load_json(
         state_path(),
         {
-            "version": 4,
+            "version": 5,
             "folders": {},
             "files": {},
             "provenance": {},
             "invoice_formats": {},
+            "invoice_records": {},
             "invoice_format_index_built": False,
             "invoice_identity_version": 0,
         },
@@ -164,9 +167,10 @@ def load_state() -> dict[str, Any]:
     state.setdefault("files", {})
     state.setdefault("provenance", {})
     state.setdefault("invoice_formats", {})
+    state.setdefault("invoice_records", {})
     state.setdefault("invoice_format_index_built", False)
     state.setdefault("invoice_identity_version", 0)
-    state["version"] = 4
+    state["version"] = 5
     return state
 
 
@@ -768,8 +772,8 @@ def buyer_validation_issues(text: str) -> list[str]:
     return issues
 
 
-def invoice_identity(text: str, filename: str = "") -> str:
-    """提取可用于跨格式去重的可靠票号；无法可靠识别时返回空字符串。"""
+def extract_invoice_number(text: str, filename: str = "") -> str:
+    """提取票面或明确文件名中的可靠票号；无法可靠识别时返回空字符串。"""
     flat = normalize_text(text)
     patterns = (
         r"发票号码?\s*[：:]?\s*([0-9][0-9\s]{6,30}[0-9])",
@@ -779,12 +783,18 @@ def invoice_identity(text: str, filename: str = "") -> str:
         if match := re.search(pattern, flat, re.I):
             number = re.sub(r"\s+", "", match.group(1))
             if 8 <= len(number) <= 30:
-                return f"number:{number}"
+                return number
 
     # 仅当文件名明确标注票号时才降级使用文件名，避免把日期误当发票号码。
     if match := re.search(r"(?:dzfp[_-]?|发票|票号|invoice)[^0-9]{0,12}([0-9]{8,30})", filename, re.I):
-        return f"number:{match.group(1)}"
+        return match.group(1)
     return ""
+
+
+def invoice_identity(text: str, filename: str = "") -> str:
+    """提取可用于跨格式去重的可靠票号；无法可靠识别时返回空字符串。"""
+    number = extract_invoice_number(text, filename)
+    return f"number:{number}" if number else ""
 
 
 def is_invoice_document(text: str, filename: str = "") -> bool:
@@ -1650,14 +1660,20 @@ def cmd_preflight(_args: argparse.Namespace) -> int:
     import pypdf
 
     ca_path = Path(certifi.where())
+    try:
+        node_path, artifact_path = find_excel_runtime()
+        excel_runtime = {"available": True, "node": str(node_path), "artifact_tool": str(artifact_path)}
+    except SkillError as exc:
+        excel_runtime = {"available": False, "code": exc.code, "detail": str(exc)}
     result = {
-        "ok": sys.version_info >= (3, 10) and ca_path.is_file(),
+        "ok": sys.version_info >= (3, 10) and ca_path.is_file() and excel_runtime["available"],
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "ca_bundle": str(ca_path),
         "ca_bundle_exists": ca_path.is_file(),
         "keyring_backend": type(keyring.get_keyring()).__name__,
         "dependencies": {"pypdf": pypdf.__version__, "pdfplumber": pdfplumber.__version__},
+        "excel_runtime": excel_runtime,
         "data_dir": str(app_data_dir()),
         "invoice_root": load_config()["invoice_root"],
     }
@@ -1815,6 +1831,175 @@ def provenance_filename(provenance: dict[str, Any], fallback: str) -> str:
         path = urllib.parse.urlsplit(str(provenance["source_url"])).path
         return urllib.parse.unquote(Path(path).name)
     return fallback
+
+
+def archived_filename_fields(filename: str) -> dict[str, str]:
+    """读取本技能生成的“日期_开票方_¥金额”归档名，仅用于回填缺失自动字段。"""
+    stem = Path(filename).stem
+    match = re.match(
+        r"^(20\d{2}-\d{2}-\d{2}|未知日期)_(.+)_¥(\d+(?:\.\d{1,2})?|未知金额)(?:_[0-9a-f]{8})?$",
+        stem,
+        re.I,
+    )
+    if not match:
+        return {"date": "", "seller": "", "amount": ""}
+    date_value, seller, amount = match.groups()
+    return {
+        "date": "" if date_value == "未知日期" else date_value,
+        "seller": "" if seller == "未知销售方" else seller,
+        "amount": "" if amount == "未知金额" else amount,
+    }
+
+
+def invoice_validation_status(review_reasons: Iterable[str]) -> str:
+    labels = {
+        "date": "发票日期缺失",
+        "seller": "开票方缺失",
+        "amount": "发票金额缺失",
+        "文字提取失败": "文字提取失败",
+    }
+    reasons = [labels.get(value, value) for value in review_reasons]
+    return "通过" if not reasons else "待确认：" + "、".join(dict.fromkeys(reasons))
+
+
+def rebuild_invoice_records(root: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+    """从已登记且仍存在的归档文件重建 Excel 自动字段，保留首次下载时间。"""
+    previous = state.setdefault("invoice_records", {})
+    current: dict[str, dict[str, Any]] = {}
+    resolved_root = root.resolve()
+    for digest, value in sorted(state.setdefault("files", {}).items()):
+        path = Path(value)
+        if not path.exists() or path.suffix.lower() not in {".pdf", ".ofd"}:
+            continue
+        try:
+            path.resolve().relative_to(resolved_root)
+        except (OSError, ValueError):
+            continue
+        provenance = state.setdefault("provenance", {}).get(digest, {})
+        hint = provenance_filename(provenance, path.name)
+        extraction_failed = False
+        try:
+            text = pdf_text(path) if path.suffix.lower() == ".pdf" else ofd_text(path)
+        except Exception:
+            text = ""
+            extraction_failed = True
+        fields = extract_invoice_fields(text)
+        archived_fields = archived_filename_fields(path.name)
+        for field_name in ("date", "seller", "amount"):
+            if not fields[field_name] and archived_fields[field_name]:
+                fields[field_name] = archived_fields[field_name]
+        invoice_number = extract_invoice_number(text, hint)
+        record_key = f"number:{invoice_number}" if invoice_number else f"sha256:{digest}"
+        review_reasons = [key for key in ("date", "seller", "amount") if not fields[key]]
+        if extraction_failed:
+            review_reasons.append("文字提取失败")
+        review_reasons.extend(buyer_validation_issues(text))
+        old_record = previous.get(record_key, {})
+        downloaded_at = old_record.get("downloaded_at")
+        if not downloaded_at:
+            downloaded_at = dt.datetime.fromtimestamp(path.stat().st_mtime).astimezone().replace(microsecond=0).isoformat()
+        record = {
+            "record_key": record_key,
+            "invoice_date": fields["date"],
+            "invoice_amount": fields["amount"],
+            "seller": fields["seller"],
+            "invoice_number": invoice_number,
+            "downloaded_at": downloaded_at,
+            "validation_status": invoice_validation_status(review_reasons),
+            "archive_path": str(path),
+        }
+        existing = current.get(record_key)
+        if existing and Path(existing["archive_path"]).suffix.lower() == ".pdf":
+            continue
+        current[record_key] = record
+    state["invoice_records"] = current
+    return list(current.values())
+
+
+def find_excel_runtime() -> tuple[Path, Path]:
+    """定位 Codex 随附的 Node.js 与 @oai/artifact-tool。"""
+    dependency_root = (
+        Path.home()
+        / ".cache"
+        / "codex-runtimes"
+        / "codex-primary-runtime"
+        / "dependencies"
+        / "node"
+    )
+    node_candidates = [
+        Path(os.environ["INVOICE_NODE_PATH"]) if os.environ.get("INVOICE_NODE_PATH") else None,
+        dependency_root / "bin" / ("node.exe" if os.name == "nt" else "node"),
+        Path(shutil.which("node")) if shutil.which("node") else None,
+    ]
+    artifact_candidates = [
+        Path(os.environ["INVOICE_ARTIFACT_TOOL_ENTRY"])
+        if os.environ.get("INVOICE_ARTIFACT_TOOL_ENTRY")
+        else None,
+        dependency_root / "node_modules" / "@oai" / "artifact-tool" / "dist" / "artifact_tool.mjs",
+    ]
+    node = next((candidate for candidate in node_candidates if candidate and candidate.is_file()), None)
+    artifact = next((candidate for candidate in artifact_candidates if candidate and candidate.is_file()), None)
+    if not node or not artifact:
+        raise SkillError(
+            "EXCEL_RUNTIME_MISSING",
+            "未找到 Codex 电子表格运行时；发票已归档，Excel 将在运行时恢复后重试同步",
+        )
+    return node, artifact
+
+
+def sync_invoice_workbook(
+    root: Path,
+    state: dict[str, Any],
+    preview_path: Path | None = None,
+) -> dict[str, Any]:
+    """生成或更新发票登记表；现有人工字段由工作簿中的记录键保留。"""
+    records = rebuild_invoice_records(root, state)
+    node, artifact = find_excel_runtime()
+    helper = Path(__file__).with_name("invoice_excel.mjs")
+    output = root / INVOICE_REGISTER_FILENAME
+    payload = {
+        "generated_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
+        "records": records,
+    }
+    with tempfile.TemporaryDirectory(prefix="invoice-register-") as temp_name:
+        payload_path = Path(temp_name) / "records.json"
+        payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        command = [str(node), str(helper), str(payload_path), str(output)]
+        if preview_path:
+            command.append(str(preview_path))
+        environment = os.environ.copy()
+        environment["INVOICE_ARTIFACT_TOOL_ENTRY"] = str(artifact)
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SkillError("EXCEL_SYNC_FAILED", f"发票登记表同步失败：{type(exc).__name__}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "未知错误"
+        raise SkillError("EXCEL_SYNC_FAILED", f"发票登记表同步失败：{detail[:500]}")
+    return {"status": "success", "path": str(output), "rows": len(records)}
+
+
+def cmd_sync_excel(args: argparse.Namespace) -> int:
+    config = load_config()
+    root = Path(config["invoice_root"]).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    state = load_state()
+    rebuild_file_index(root, state)
+    rebuild_invoice_identity_index(root, state)
+    preview_path = Path(args.preview).expanduser().resolve() if args.preview else None
+    result = sync_invoice_workbook(root, state, preview_path)
+    atomic_json_write(state_path(), state)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def rebuild_invoice_identity_index(root: Path, state: dict[str, Any]) -> None:
@@ -1988,6 +2173,17 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
             )
             atomic_json_write(state_path(), state)
+    try:
+        invoice_register = sync_invoice_workbook(root, state)
+    except Exception as exc:
+        rebuild_invoice_records(root, state)
+        invoice_register = {
+            "status": "error",
+            "code": error_code(exc, "EXCEL_SYNC_FAILED"),
+            "path": str(root / INVOICE_REGISTER_FILENAME),
+            "detail": str(exc),
+        }
+    atomic_json_write(state_path(), state)
     counts = {status: sum(item["status"] == status for item in results) for status in ("success", "skipped", "incomplete", "error")}
     print(
         json.dumps(
@@ -1995,13 +2191,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "invoice_root": str(root),
                 "scan": scan_metadata(explicit_range, from_date, to_date, start_from_now, bool(unconfirmed)),
                 "counts": counts,
+                "invoice_register": invoice_register,
                 "items": results,
             },
             ensure_ascii=False,
             indent=2,
         )
     )
-    return 2 if counts["error"] else (1 if counts["incomplete"] else 0)
+    return 2 if counts["error"] or invoice_register["status"] == "error" else (1 if counts["incomplete"] else 0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2051,6 +2248,10 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--account", help="只清理指定邮箱的待处理 UID；失效归档索引始终全局清理")
     repair.add_argument("--confirm", action="store_true", help="确认丢弃待处理扫描和失效索引")
     repair.set_defaults(handler=cmd_repair_state)
+
+    sync_excel = subparsers.add_parser("sync-excel", help="从已归档发票补录或更新发票登记表")
+    sync_excel.add_argument("--preview", help="可选：同时把登记表渲染为指定 PNG，供检查使用")
+    sync_excel.set_defaults(handler=cmd_sync_excel)
 
     run = subparsers.add_parser("run", help="执行一次扫描、下载和归档")
     run.add_argument("--account", help="只运行指定邮箱")
