@@ -1,12 +1,14 @@
 # Invoice Mail Downloader Skill
 
-一个支持 `SKILL.md` 的 AI Agent Skill：从已配置的 163 邮箱或 QQ 邮箱中按需查找电子发票附件和可信下载链接，下载 PDF/OFD、解包 ZIP、按日期命名归档，并自动维护 `发票登记.xlsx`。同一发票优先保留 PDF，只有没有 PDF 时才保留 OFD。
+一个支持 `SKILL.md` 的 AI Agent Skill：从 163/QQ 邮箱下载并归档电子发票，自动维护 `发票登记.xlsx`，并使用 TextIn XParse 免费模式识别、匹配和归档报销凭证。
 
 ## 安装
 
+运行环境为 **macOS 或 Windows**（不支持 Linux）。需要 Python 3.10+。
+
 ### Codex
 
-macOS / Linux：
+macOS：
 
 ```bash
 git clone https://github.com/benttianbao/invoice-mail-downloader-skill.git ~/.codex/skills/invoice-mail-downloader
@@ -26,7 +28,7 @@ $invoice-mail-downloader
 
 ### WorkBuddy
 
-macOS / Linux：
+macOS：
 
 ```bash
 git clone https://github.com/benttianbao/invoice-mail-downloader-skill.git ~/.workbuddy/skills/invoice-mail-downloader
@@ -61,7 +63,7 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 完整操作边界和步骤以 [SKILL.md](SKILL.md) 为准。核心要求：
 
 - Python 3.10 或更高版本；
-- macOS 或 Windows；
+- 仅 macOS 或 Windows，不支持 Linux；
 - 先在邮箱网页端开启 IMAP 并生成客户端授权码；
 - 优先使用一次性本地配置页面，普通用户不需要操作终端；
 - 授权码只保存到 macOS 钥匙串或 Windows 凭据管理器；
@@ -73,6 +75,10 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 - 可信发票平台返回的 PDF 即使文字识别失败也会保留到 `待确认/`，不会误判完成后丢弃；
 - 下载完成后自动维护发票登记表，按票号或文件哈希去重，并保留支付日期、收款姓名、报销金额、费用类型和备注等人工字段；
 - 自动填写发票日期、发票金额、开票方、发票编号、下载时间和校验状态；费用类型提供“部门营销费用、企业文化费用、出差报销费用”下拉选项；
+- 自动创建 `报销凭证待匹配/` 投放目录；其中的 PDF/OFD 先用本地 Python 识别并按发票规则归档。提取失败或无法识别的 OFD 放入 `待确认/`；有文字但不是发票的 PDF 再匹配报销凭证；
+- 登记表增加凭证是否存在、相对路径、匹配状态、校验说明和“发票与实付差额”，并在人工支付日期为空时从凭证补充；员工“收款姓名”等人工字段始终保留；
+- 支持微信“扫二维码付款-给…”、转账时间和转账单号；实付低于发票金额不超过 1.00 元（含）时按支付优惠匹配并在登记表标注差额，实付高于发票金额仍拒绝自动匹配；
+- 缺少固定收款方标签时，会用 OCR 全文中的完整开票方名称兜底；明确收款方冲突或名称只出现在付款方、付款账户、备注等上下文时仍拒绝自动匹配；
 - 修改归档目录和增加可信下载域名都需要用户明确确认。
 
 首次升级后可在不连接邮箱的情况下补录现有归档：
@@ -81,7 +87,21 @@ git -C "/absolute/path/to/invoice-mail-downloader" pull --ff-only
 python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" sync-excel
 ```
 
-Windows 将 `python3` 替换为 `py -3`。Excel 功能依赖 Codex 随附的 `@oai/artifact-tool` 运行时，`preflight` 会检查其可用性。
+Windows 将 `python3` 替换为 `py -3`。Excel 优先使用 Codex 随附的 `@oai/artifact-tool`；若不可用，则使用 Python 依赖中的 `openpyxl`。`preflight` 的 `ok` 只检查核心运行环境，Excel 与 XParse 作为可选能力单独报告。
+
+报销凭证通过 TextIn XParse 公有服务识别，文件会上传至 TextIn；敏感凭证请勿放入投放目录。安装凭证识别能力：
+
+```bash
+python3 "/absolute/path/to/invoice-mail-downloader/scripts/bootstrap.py" --with-receipts
+```
+
+该步骤需要 Node.js 18+ 与 npm，会把官方 `xparse-cli` 装到隔离的应用数据目录。随后可单独运行：
+
+```bash
+python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" match-receipts
+```
+
+技能只使用免登录免费模式，不会自动切换付费 API；同一文件默认复用本地精简缓存，不重复消耗额度。
 
 安装隔离依赖：
 
@@ -122,4 +142,4 @@ python3 "/absolute/path/to/invoice-mail-downloader/scripts/run_skill.py" run --s
 python -m unittest discover -s tests -v
 ```
 
-当前包含 62 项离线回归测试。真实邮箱连接需要用户使用自己的客户端授权码在本机验证。
+当前包含离线回归测试。真实邮箱连接和 TextIn 公有服务需要在本机集成验证。

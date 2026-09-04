@@ -1,6 +1,6 @@
 interface:
   display_name: "邮箱发票下载整理"
-  short_description: "从163和QQ邮箱安全归档电子发票并维护Excel登记表"
-  default_prompt: "使用 $invoice-mail-downloader 从已配置邮箱下载并整理本次发票。"
+  short_description: "归档电子发票、维护Excel并匹配报销凭证"
+  default_prompt: "使用 $invoice-mail-downloader 下载整理发票，并匹配投放目录中的报销凭证。"
 policy:
   allow_implicit_invocation: false

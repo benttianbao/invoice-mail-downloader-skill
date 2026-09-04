@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import contextvars
 import datetime as dt
+from decimal import Decimal, InvalidOperation
 from email import policy
 from email.header import decode_header, make_header
 from email.message import Message
@@ -32,6 +34,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,24 +57,40 @@ KNOWN_PROVIDER_PAGE_HOSTS = {"nnfp.jss.com.cn", "pis.baiwang.com"}
 REQUIRED_BUYER_NAME = "永赢金融租赁有限公司"
 REQUIRED_BUYER_TAX_ID = "91330200316986507A"
 INVOICE_REGISTER_FILENAME = "发票登记.xlsx"
+RECEIPT_INBOX_NAME = "报销凭证待匹配"
+RECEIPT_SUFFIXES = {".jpg", ".jpeg", ".png", ".heic", ".webp", ".pdf"}
+INBOX_INVOICE_SUFFIXES = {".pdf", ".ofd"}
+XPARSE_FREE_MAX_BYTES = 10 * 1024 * 1024
+XPARSE_TIMEOUT_SECONDS = 180
+RECEIPT_DATE_BEFORE_DAYS = 90
+RECEIPT_DATE_AFTER_DAYS = 7
 PROVIDERS = {
     "163": {"domain": "163.com", "imap": "imap.163.com", "port": 993},
     "qq": {"domain": "qq.com", "imap": "imap.qq.com", "port": 993},
 }
 EXCLUDED_FLAGS = {b"\\Sent", b"\\Drafts", b"\\Trash", b"\\Junk", b"\\Noselect"}
-EXCLUDED_NAMES = (
+EXCLUDED_FOLDER_NAMES = {
     "sent",
     "draft",
+    "drafts",
     "trash",
     "junk",
     "spam",
-    "deleted messages",
     "deleted",
+    "deleted messages",
     "已发送",
     "草稿",
     "垃圾",
+    "垃圾箱",
+    "垃圾邮件",
     "已删除",
-)
+}
+EXCLUDED_FOLDER_TOKENS = {"sent", "draft", "drafts", "trash", "junk", "spam", "deleted"}
+IMAP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+XPARSE_DETERMINISTIC_CODES = {"XPARSE_FILE_TOO_LARGE", "RECEIPT_IMAGE_INVALID"}
+XPARSE_QUOTA_CODES = {"XPARSE_QUOTA_EXCEEDED"}
+_buyer_name = contextvars.ContextVar("buyer_name", default=REQUIRED_BUYER_NAME)
+_buyer_tax_id = contextvars.ContextVar("buyer_tax_id", default=REQUIRED_BUYER_TAX_ID)
 
 
 class SkillError(RuntimeError):
@@ -82,6 +101,42 @@ class SkillError(RuntimeError):
 
 def error_code(exc: BaseException, fallback: str) -> str:
     return exc.code if isinstance(exc, SkillError) else fallback
+
+
+def current_buyer() -> tuple[str, str]:
+    return _buyer_name.get(), _buyer_tax_id.get()
+
+
+def apply_buyer_from_config(config: dict[str, Any]) -> None:
+    _buyer_name.set(str(config.get("required_buyer_name") or REQUIRED_BUYER_NAME).strip() or REQUIRED_BUYER_NAME)
+    _buyer_tax_id.set(
+        re.sub(r"[^0-9A-Z]", "", str(config.get("required_buyer_tax_id") or REQUIRED_BUYER_TAX_ID).upper())
+        or REQUIRED_BUYER_TAX_ID
+    )
+
+
+def imap_date(value: dt.date) -> str:
+    return f"{value.day:02d}-{IMAP_MONTHS[value.month - 1]}-{value.year}"
+
+
+def folder_is_excluded(display_name: str, flags: set[bytes], delimiter: str = "") -> bool:
+    if flags & EXCLUDED_FLAGS:
+        return True
+    stripped = display_name.strip()
+    lowered = stripped.lower()
+    if lowered in EXCLUDED_FOLDER_NAMES or stripped in EXCLUDED_FOLDER_NAMES:
+        return True
+    separators = {" ", "/", "_", "-", "."}
+    if delimiter:
+        separators.add(delimiter)
+    tokens = [token for token in re.split("[" + re.escape("".join(separators)) + "]+", stripped) if token]
+    lowered_tokens = [token.lower() for token in tokens]
+    if any(token in EXCLUDED_FOLDER_NAMES or token.lower() in EXCLUDED_FOLDER_NAMES for token in tokens):
+        return True
+    if any(token in EXCLUDED_FOLDER_TOKENS for token in lowered_tokens):
+        return True
+    last = tokens[-1] if tokens else stripped
+    return last in EXCLUDED_FOLDER_NAMES or last.lower() in EXCLUDED_FOLDER_NAMES
 
 
 def app_data_dir() -> Path:
@@ -136,6 +191,8 @@ def load_config() -> dict[str, Any]:
         "version": 3,
         "invoice_root": str(default_invoice_root()),
         "trusted_domains": [],
+        "required_buyer_name": REQUIRED_BUYER_NAME,
+        "required_buyer_tax_id": REQUIRED_BUYER_TAX_ID,
         "accounts": [],
     }
     config = load_json(config_path(), defaults.copy())
@@ -153,12 +210,13 @@ def load_state() -> dict[str, Any]:
     state = load_json(
         state_path(),
         {
-            "version": 5,
+            "version": 6,
             "folders": {},
             "files": {},
             "provenance": {},
             "invoice_formats": {},
             "invoice_records": {},
+            "receipt_records": {},
             "invoice_format_index_built": False,
             "invoice_identity_version": 0,
         },
@@ -168,9 +226,10 @@ def load_state() -> dict[str, Any]:
     state.setdefault("provenance", {})
     state.setdefault("invoice_formats", {})
     state.setdefault("invoice_records", {})
+    state.setdefault("receipt_records", {})
     state.setdefault("invoice_format_index_built", False)
     state.setdefault("invoice_identity_version", 0)
-    state["version"] = 5
+    state["version"] = 6
     return state
 
 
@@ -741,8 +800,9 @@ def extract_buyer_fields(text: str) -> dict[str, str]:
 
     # 仅当购买方代码已经精确匹配时，才跨双栏文字层确认目标名称，
     # 避免目标公司仅出现在销售方一侧时产生误判。
-    if tax_id == REQUIRED_BUYER_TAX_ID and re.sub(r"\s+", "", REQUIRED_BUYER_NAME) in compact:
-        name = REQUIRED_BUYER_NAME
+    expected_name, expected_tax_id = current_buyer()
+    if tax_id == expected_tax_id and re.sub(r"\s+", "", expected_name) in compact:
+        name = expected_name
 
     return {"name": name, "tax_id": tax_id}
 
@@ -757,8 +817,9 @@ def buyer_validation_issues(text: str) -> list[str]:
     if is_railway_ticket(text):
         return []
     buyer = extract_buyer_fields(text)
+    expected_name, expected_tax_id = current_buyer()
     actual_name = re.sub(r"\s+", "", buyer["name"])
-    expected_name = re.sub(r"\s+", "", REQUIRED_BUYER_NAME)
+    expected_name = re.sub(r"\s+", "", expected_name)
     actual_tax_id = re.sub(r"[^0-9A-Z]", "", buyer["tax_id"].upper())
     issues: list[str] = []
     if not actual_name:
@@ -767,7 +828,7 @@ def buyer_validation_issues(text: str) -> list[str]:
         issues.append("购买方名称不匹配")
     if not actual_tax_id:
         issues.append("购买方纳税人识别号缺失")
-    elif actual_tax_id != REQUIRED_BUYER_TAX_ID:
+    elif actual_tax_id != expected_tax_id:
         issues.append("购买方纳税人识别号不匹配")
     return issues
 
@@ -834,6 +895,731 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def receipt_cache_path(digest: str) -> Path:
+    return app_data_dir() / "receipt-cache" / f"{digest}.json"
+
+
+def find_xparse_cli() -> Path:
+    """定位 TextIn 官方 CLI；免费模式不读取或保存 API 密钥。"""
+    configured = os.environ.get("INVOICE_XPARSE_CLI", "").strip()
+    local_bin = app_data_dir() / "xparse-cli" / "node_modules" / ".bin"
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        local_bin / ("xparse-cli.cmd" if os.name == "nt" else "xparse-cli"),
+    ]
+    for command in ("xparse-cli", "xparse-cli.exe"):
+        located = shutil.which(command)
+        if located:
+            candidates.append(Path(located))
+    executable = next((path for path in candidates if path and path.is_file()), None)
+    if executable is None:
+        raise SkillError(
+            "XPARSE_CLI_MISSING",
+            "未找到 TextIn xparse-cli；报销凭证未上传，请重新运行 bootstrap.py 后重试",
+        )
+    return executable
+
+
+def prepare_receipt_upload(source: Path, temp_dir: Path) -> Path:
+    """把图片转换为不含 EXIF 的兼容副本；原始凭证保持不变。"""
+    suffix = source.suffix.lower()
+    if source.stat().st_size > XPARSE_FREE_MAX_BYTES and suffix == ".pdf":
+        raise SkillError("XPARSE_FILE_TOO_LARGE", "免费 XParse 单文件不得超过 10 MB")
+    if suffix == ".pdf":
+        return source
+    try:
+        from PIL import Image, ImageOps
+        if suffix == ".heic":
+            from pillow_heif import register_heif_opener
+
+            register_heif_opener()
+    except ImportError as exc:
+        raise SkillError("RECEIPT_IMAGE_RUNTIME_MISSING", "缺少 Pillow/pillow-heif 图片处理依赖") from exc
+
+    target = temp_dir / f"{sha256_file(source)}.jpg"
+    try:
+        with Image.open(source) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+            longest = max(image.size)
+            if longest > 20000:
+                scale = 20000 / longest
+                image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
+            quality = 92
+            while True:
+                image.save(target, format="JPEG", quality=quality, optimize=True)
+                if target.stat().st_size <= XPARSE_FREE_MAX_BYTES or quality <= 60:
+                    break
+                quality -= 8
+            while target.stat().st_size > XPARSE_FREE_MAX_BYTES and max(image.size) > 1200:
+                image = image.resize((max(1, int(image.width * 0.85)), max(1, int(image.height * 0.85))))
+                image.save(target, format="JPEG", quality=76, optimize=True)
+    except SkillError:
+        raise
+    except Exception as exc:
+        raise SkillError("RECEIPT_IMAGE_INVALID", f"凭证图片无法读取：{type(exc).__name__}") from exc
+    if target.stat().st_size > XPARSE_FREE_MAX_BYTES:
+        raise SkillError("XPARSE_FILE_TOO_LARGE", "图片压缩后仍超过免费 XParse 10 MB 限制")
+    return target
+
+
+def _xparse_text_nodes(value: Any, output: list[dict[str, Any]]) -> None:
+    if isinstance(value, dict):
+        text_value = value.get("text")
+        if isinstance(text_value, str) and text_value.strip():
+            output.append(
+                {
+                    "text": text_value.strip(),
+                    "page_number": value.get("page_number"),
+                    "coordinates": value.get("coordinates") if isinstance(value.get("coordinates"), list) else None,
+                }
+            )
+        for key, child in value.items():
+            if key not in {"image", "image_data", "base64", "url", "page_image_url"}:
+                _xparse_text_nodes(child, output)
+    elif isinstance(value, list):
+        for child in value:
+            _xparse_text_nodes(child, output)
+
+
+def simplify_xparse_result(value: dict[str, Any]) -> dict[str, Any]:
+    """只保留字段解析需要的文本和位置，不落盘图片或远程 URL。"""
+    data = value.get("data") if isinstance(value.get("data"), dict) else value
+    markdown = data.get("markdown", "") if isinstance(data, dict) else ""
+    nodes: list[dict[str, Any]] = []
+    _xparse_text_nodes(data, nodes)
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, Any]] = set()
+    for node in nodes:
+        key = (node["text"], node.get("page_number"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(node)
+    text = str(markdown).strip() or "\n".join(node["text"] for node in unique)
+    return {
+        "status": "success",
+        "text": text,
+        "elements": unique,
+        "engine": "textin-xparse-free",
+        "cached_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
+    }
+
+
+def parse_json_output(output: str) -> dict[str, Any]:
+    stripped = output.strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start < 0 or end <= start:
+            raise SkillError("XPARSE_RESPONSE_INVALID", "XParse 未返回 JSON")
+        try:
+            value = json.loads(stripped[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise SkillError("XPARSE_RESPONSE_INVALID", "XParse 返回的 JSON 无法解析") from exc
+    if not isinstance(value, dict):
+        raise SkillError("XPARSE_RESPONSE_INVALID", "XParse 返回结果不是 JSON 对象")
+    return value
+
+
+def run_xparse(source: Path, temp_dir: Path) -> dict[str, Any]:
+    upload = prepare_receipt_upload(source, temp_dir)
+    command = [
+        str(find_xparse_cli()), "parse", str(upload), "--api", "free", "--view", "json",
+        "--include-image-data=false", "--include-inline-objects=false",
+        "--include-table-structure=false", "--include-title-tree=false",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=XPARSE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SkillError("XPARSE_TIMEOUT", "XParse 识别超过 180 秒") from exc
+    except OSError as exc:
+        raise SkillError("XPARSE_RUN_FAILED", f"XParse 无法启动：{type(exc).__name__}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "未知错误"
+        code = "XPARSE_QUOTA_EXCEEDED" if re.search(r"1000|quota|额度", detail, re.I) else "XPARSE_RUN_FAILED"
+        raise SkillError(code, f"XParse 免费识别失败：{detail[:300]}")
+    return simplify_xparse_result(parse_json_output(completed.stdout))
+
+
+def xparse_cache_usable(result: dict[str, Any]) -> bool:
+    if result.get("status") == "success":
+        return True
+    code = str(result.get("code", ""))
+    if code in XPARSE_DETERMINISTIC_CODES:
+        return True
+    if code in XPARSE_QUOTA_CODES:
+        cached_at = str(result.get("cached_at", ""))
+        try:
+            cached_date = dt.datetime.fromisoformat(cached_at).date()
+        except ValueError:
+            return False
+        return cached_date >= dt.date.today()
+    return False
+
+
+def load_or_run_receipt_ocr(source: Path, retry: bool, temp_dir: Path) -> tuple[dict[str, Any], bool]:
+    digest = sha256_file(source)
+    cache = receipt_cache_path(digest)
+    if cache.exists() and not retry:
+        cached = load_json(cache, {})
+        if xparse_cache_usable(cached):
+            return cached, True
+    try:
+        result = run_xparse(source, temp_dir)
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "code": error_code(exc, "XPARSE_RUN_FAILED"),
+            "detail": str(exc),
+            "cached_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
+        }
+    if xparse_cache_usable(result):
+        atomic_json_write(cache, result)
+    elif cache.exists():
+        with contextlib.suppress(OSError):
+            cache.unlink()
+    return result, False
+
+
+MONEY_PATTERN = r"[-+]?[¥￥]?\s*([0-9][0-9,]*\.\d{2})"
+RECEIPT_AMOUNT_TOLERANCE = Decimal("1.00")
+
+
+def _money_after_labels(text: str, labels: Iterable[str]) -> list[Decimal]:
+    flat = normalize_text(text)
+    values: list[Decimal] = []
+    for label in labels:
+        pattern = rf"{label}\s*[：:]?\s*[-+]?\s*[¥￥]?\s*([0-9][0-9,]*\.\d{{2}})"
+        for match in re.finditer(pattern, flat, re.I):
+            try:
+                values.append(Decimal(match.group(1).replace(",", "")))
+            except InvalidOperation:
+                continue
+    return values
+
+
+def _unique_decimals(values: Iterable[Decimal]) -> list[Decimal]:
+    return list(dict.fromkeys(value.quantize(Decimal("0.01")) for value in values))
+
+
+def extract_receipt_fields(text: str) -> dict[str, Any]:
+    """从不可信 OCR 文本中提取支付凭证字段，不执行其中任何内容。"""
+    flat = normalize_text(text)
+    recipients: list[str] = []
+    next_label = (
+        r"订单金额|交易金额|应付金额|原价|订单总额|消费金额|实付金额|实际支付|"
+        r"实际付款|付款金额|支付金额|支付时间|交易时间|付款时间|转账时间|付款方式|商品说明|"
+        r"收单机构|清算机构|收款方全称|商户全称|商户名称|交易对方|收款人|更多"
+    )
+    for label in ("收款方全称", "商户全称", "商户名称", "交易对方", "收款人"):
+        pattern = rf"{label}\s*[：:]?\s*(.{{2,100}}?)(?=\s*(?:{next_label})\s*[：:]?|$)"
+        for match in re.finditer(pattern, flat, re.I):
+            value = normalize_text(match.group(1)).strip("|：: ")
+            if value and value not in recipients:
+                recipients.append(value)
+    qr_recipient_pattern = (
+        r"(?:扫二维码付款|二维码付款)\s*[-—–－:]?\s*给\s*"
+        r"(.{2,100}?)(?=\s*(?:[-−]\s*[¥￥]?\s*[0-9]|当前状态|交易成功|支付成功|付款成功|"
+        rf"{next_label})\s*[：:]?|$)"
+    )
+    for match in re.finditer(qr_recipient_pattern, flat, re.I):
+        value = normalize_text(match.group(1)).strip("|：: -—–－")
+        if value and value not in recipients:
+            recipients.append(value)
+
+    original = _unique_decimals(
+        _money_after_labels(text, ("订单金额", "交易金额", "应付金额", "原价", "订单总额", "消费金额"))
+    )
+    paid = _unique_decimals(
+        _money_after_labels(text, ("实付金额", "实际支付金额?", "实际付款金额?", "付款金额", "支付金额", "支出金额"))
+    )
+    if not paid:
+        negatives = re.findall(r"-\s*[¥￥]?\s*([0-9][0-9,]*\.\d{2})", flat)
+        parsed_negatives = [Decimal(value.replace(",", "")) for value in negatives]
+        paid = [max(parsed_negatives)] if parsed_negatives else []
+    discounts: list[Decimal] = []
+    for match in re.finditer(
+        r"(?:优惠券?|红包|立减金?|支付优惠|银行卡优惠|折扣|减免).{0,20}?[-+]?\s*[¥￥]?\s*([0-9][0-9,]*\.\d{2})",
+        flat,
+        re.I,
+    ):
+        with contextlib.suppress(InvalidOperation):
+            discounts.append(abs(Decimal(match.group(1).replace(",", ""))))
+
+    payment_time = ""
+    time_match = re.search(
+        r"(?:支付时间|交易时间|付款时间|转账时间)\s*[：:]?\s*(20\d{2})[-年/.](\d{1,2})[-月/.](\d{1,2})日?\s*(\d{1,2})?[：:]?(\d{1,2})?[：:]?(\d{1,2})?",
+        flat,
+    )
+    if time_match:
+        parts = [int(value) if value else 0 for value in time_match.groups()]
+        try:
+            payment_time = dt.datetime(*parts[:3], *parts[3:]).isoformat(timespec="seconds")
+        except ValueError:
+            payment_time = ""
+
+    transaction_ids: list[str] = []
+    for match in re.finditer(
+        r"(?:交易单号|商户订单号|支付流水号|交易流水号|转账单号)\s*[：:]?\s*([0-9A-Za-z_-]{8,64})",
+        flat,
+        re.I,
+    ):
+        if match.group(1) not in transaction_ids:
+            transaction_ids.append(match.group(1))
+
+    if re.search(r"退款|已撤销|交易关闭|冲正|退回", flat):
+        transaction_status = "refund"
+    elif re.search(r"处理中|待入账|待支付|支付失败|交易失败|已关闭|已取消", flat):
+        transaction_status = "invalid"
+    elif re.search(r"交易成功|支付成功|付款成功|交易完成|支付完成|已完成", flat):
+        transaction_status = "success"
+    else:
+        transaction_status = "missing"
+    return {
+        "merchant_names": recipients,
+        "original_amounts": [str(value) for value in original],
+        "paid_amounts": [str(value) for value in paid],
+        "discount_amount": str(sum(discounts, Decimal("0")).quantize(Decimal("0.01"))) if discounts else "",
+        "payment_time": payment_time,
+        "transaction_ids": transaction_ids,
+        "transaction_status": transaction_status,
+    }
+
+
+def normalized_party(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).lower()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", value)
+
+
+def seller_matches_receipt(seller: str, names: Iterable[str]) -> bool:
+    expected = normalized_party(seller)
+    return bool(expected) and any(expected in normalized_party(name) for name in names)
+
+
+def seller_matches_receipt_full_text(seller: str, text: str) -> bool:
+    """在 OCR 全文中查找完整销方名称，但排除明显的付款方上下文。"""
+    expected = normalized_party(seller)
+    haystack = normalized_party(text)
+    if not expected or not haystack:
+        return False
+    blocked_prefixes = tuple(
+        normalized_party(label)
+        for label in (
+            "付款方全称", "付款方名称", "付款方", "付款人", "支付方",
+            "付款户名", "付款账户名", "付款账户", "备注",
+        )
+    )
+    start = 0
+    while True:
+        index = haystack.find(expected, start)
+        if index < 0:
+            return False
+        prefix = haystack[max(0, index - 16):index]
+        if not any(prefix.endswith(label) for label in blocked_prefixes):
+            return True
+        start = index + len(expected)
+
+
+def receipt_seller_match_source(seller: str, fields: dict[str, Any], text: str = "") -> str:
+    names = fields.get("merchant_names") or []
+    if names:
+        return "structured" if seller_matches_receipt(seller, names) else ""
+    return "full_text" if seller_matches_receipt_full_text(seller, text) else ""
+
+
+def receipt_transaction_fingerprint(fields: dict[str, Any]) -> str:
+    transaction_ids = fields.get("transaction_ids") or []
+    if len(transaction_ids) == 1:
+        return f"id:{transaction_ids[0]}"
+    payload = "|".join(
+        (
+            ",".join(normalized_party(value) for value in fields.get("merchant_names", [])),
+            ",".join(fields.get("original_amounts", [])),
+            ",".join(fields.get("paid_amounts", [])),
+            str(fields.get("payment_time", "")),
+        )
+    )
+    return "fields:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def receipt_candidate(invoice: dict[str, Any], fields: dict[str, Any], text: str = "") -> tuple[bool, str]:
+    if invoice.get("validation_status") != "通过":
+        return False, "发票自身待确认"
+    if not all(invoice.get(key) for key in ("invoice_number", "invoice_date", "invoice_amount", "seller")):
+        return False, "发票关键字段缺失"
+    if invoice.get("has_receipt") == "是":
+        return False, "发票已有报销凭证"
+    status = fields.get("transaction_status")
+    if status == "refund":
+        return False, "存在退款、撤销或冲正"
+    if status == "invalid":
+        return False, "交易未成功"
+    if status != "success":
+        return False, "交易状态缺失"
+    names = fields.get("merchant_names") or []
+    seller = str(invoice["seller"])
+    if names and not seller_matches_receipt(seller, names):
+        return False, "收款方与开票方不一致"
+    if not names and not seller_matches_receipt_full_text(seller, text):
+        return False, "收款方全称缺失"
+    if (
+        len(fields.get("transaction_ids") or []) > 1
+        or len(fields.get("original_amounts") or []) > 1
+        or len(fields.get("paid_amounts") or []) > 1
+    ):
+        return False, "凭证包含多笔交易"
+    try:
+        invoice_amount = Decimal(str(invoice["invoice_amount"])).quantize(Decimal("0.01"))
+        original_values = [Decimal(value) for value in fields.get("original_amounts") or []]
+        paid_values = [Decimal(value) for value in fields.get("paid_amounts") or []]
+    except InvalidOperation:
+        return False, "金额无法解析"
+    original = original_values[0].quantize(Decimal("0.01")) if len(original_values) == 1 else None
+    paid = paid_values[0].quantize(Decimal("0.01")) if len(paid_values) == 1 else None
+    if original is not None:
+        if original != invoice_amount:
+            return False, "优惠前订单金额与发票金额不一致"
+        if paid is not None and paid > original:
+            return False, "实付金额高于订单金额"
+        if paid is not None and paid < original:
+            difference = original - paid
+            if difference <= RECEIPT_AMOUNT_TOLERANCE:
+                discount = fields.get("discount_amount")
+                if discount and abs(difference - Decimal(str(discount))) > Decimal("0.01"):
+                    return False, "优惠明细与差额不一致"
+            else:
+                discount = fields.get("discount_amount")
+                if not discount:
+                    return False, "优惠差额无法解释"
+                if abs(difference - Decimal(str(discount))) > Decimal("0.01"):
+                    return False, "优惠明细与差额不一致"
+    elif paid is None:
+        return False, "支付金额缺失"
+    elif paid > invoice_amount:
+        return False, "实付金额高于发票金额"
+    elif invoice_amount - paid > RECEIPT_AMOUNT_TOLERANCE:
+        return False, "实付金额与发票金额不一致"
+
+    payment_time = str(fields.get("payment_time", ""))
+    if payment_time:
+        try:
+            payment_date = dt.date.fromisoformat(payment_time[:10])
+            invoice_date = dt.date.fromisoformat(str(invoice["invoice_date"]))
+            days = (payment_date - invoice_date).days
+            if days < -RECEIPT_DATE_BEFORE_DAYS or days > RECEIPT_DATE_AFTER_DAYS:
+                return False, "支付日期超出允许范围"
+        except ValueError:
+            return False, "支付日期无法解析"
+    return True, "开票方、金额和交易状态一致"
+
+
+def receipt_amount_difference(invoice_amount: Any, fields: dict[str, Any]) -> str:
+    paid_values = fields.get("paid_amounts") or []
+    if len(paid_values) != 1:
+        return ""
+    try:
+        difference = Decimal(str(invoice_amount)) - Decimal(str(paid_values[0]))
+    except InvalidOperation:
+        return ""
+    return str(difference.quantize(Decimal("0.01")))
+
+
+def receipt_match_detail(
+    fields: dict[str, Any], invoice_amount: Any = "", seller: str = "", text: str = ""
+) -> str:
+    original = (fields.get("original_amounts") or [""])[0]
+    paid = (fields.get("paid_amounts") or [""])[0]
+    discount = fields.get("discount_amount", "")
+    source = receipt_seller_match_source(seller, fields, text) if seller else "structured"
+    parts = ["OCR 全文包含完整开票方" if source == "full_text" else "开票方与收款方一致"]
+    if original:
+        parts.append(f"订单金额 {original} 元")
+    if paid:
+        parts.append(f"实际支付 {paid} 元")
+    if discount:
+        parts.append(f"优惠 {discount} 元")
+    difference = receipt_amount_difference(invoice_amount, fields)
+    if difference:
+        parts.append(f"发票与实付差额 {difference} 元")
+    return "；".join(parts)
+
+
+def receipt_destination(invoice: dict[str, Any], source: Path, digest: str) -> Path:
+    invoice_path = Path(str(invoice["archive_path"]))
+    destination = invoice_path.with_name(f"{invoice_path.stem}_报销凭证{source.suffix.lower()}")
+    if destination.exists() and sha256_file(destination) != digest:
+        destination = destination.with_name(f"{destination.stem}_{digest[:8]}{destination.suffix}")
+    return destination
+
+
+def _receipt_result(status: str, source: Path, detail: str, code: str = "") -> dict[str, Any]:
+    value = {"status": status, "source": str(source), "detail": detail}
+    if code:
+        value["code"] = code
+    return value
+
+
+def inbox_invoice_handled(status: str, detail: str) -> bool:
+    if status == "success":
+        return True
+    return status == "skipped" and "不是可识别的发票" not in detail
+
+
+def inbox_invoice_code(status: str, detail: str) -> str:
+    if not inbox_invoice_handled(status, detail):
+        return "INBOX_NOT_INVOICE"
+    if "文字提取失败" in detail:
+        return "INBOX_INVOICE_UNREADABLE"
+    if "未能识别为发票" in detail:
+        return "INBOX_OFD_UNRECOGNIZED"
+    return "INBOX_INVOICE_ARCHIVED"
+
+
+def inbox_invoice_summary(items: list[dict[str, Any]]) -> dict[str, int]:
+    archived = 0
+    pending_review = 0
+    left_for_receipts = 0
+    for item in items:
+        code = str(item.get("code", ""))
+        if code == "INBOX_NOT_INVOICE":
+            left_for_receipts += 1
+            continue
+        archived += 1
+        if "待确认" in str(item.get("detail", "")) or code in {"INBOX_INVOICE_UNREADABLE", "INBOX_OFD_UNRECOGNIZED"}:
+            pending_review += 1
+    return {
+        "archived": archived,
+        "pending_review": pending_review,
+        "left_for_receipts": left_for_receipts,
+    }
+
+
+def archive_dropped_invoices(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """投放目录中的 PDF/OFD 先按本地文字提取归档，不调用 XParse。"""
+    inbox = root / RECEIPT_INBOX_NAME
+    inbox.mkdir(parents=True, exist_ok=True)
+    candidates = sorted(
+        (path for path in inbox.iterdir() if path.is_file() and path.suffix.lower() in INBOX_INVOICE_SUFFIXES),
+        key=lambda path: ({".pdf": 0, ".ofd": 1}.get(path.suffix.lower(), 9), path.name.lower()),
+    )
+    items: list[dict[str, Any]] = []
+    seen_pdf_keys: set[str] = set()
+    with tempfile.TemporaryDirectory(prefix="inbox-invoice-") as temp_name:
+        temp_dir = Path(temp_name)
+        for source in candidates:
+            provenance = {"source_type": "inbox", "original_filename": source.name}
+            results = process_file(
+                source, source.name, root, state, temp_dir, provenance, seen_pdf_keys, False, True
+            )
+            handled = False
+            destinations: list[Path] = []
+            for status, _name, detail in results:
+                item = _receipt_result(status, source, detail)
+                item["code"] = inbox_invoice_code(status, detail)
+                if inbox_invoice_handled(status, detail):
+                    handled = True
+                    destinations.append(Path(detail.split("；", 1)[0]))
+                items.append(item)
+            if not handled or not source.exists():
+                continue
+            if any(path.exists() and path.resolve() == source.resolve() for path in destinations):
+                continue
+            source.unlink(missing_ok=True)
+    counts = {status: sum(item["status"] == status for item in items) for status in ("success", "skipped", "incomplete", "error")}
+    summary = inbox_invoice_summary(items)
+    return {"status": "success", "inbox": str(inbox), "counts": counts, "summary": summary, "items": items}
+
+
+def discover_manually_placed_receipts(root: Path, state: dict[str, Any], invoices: list[dict[str, Any]]) -> None:
+    """识别日期目录中用户手工放入的凭证，不扫描任意根目录文件。"""
+    invoice_paths = {Path(value).resolve() for value in state.setdefault("files", {}).values() if Path(value).exists()}
+    records = state.setdefault("receipt_records", {})
+    invoices_by_dir: dict[Path, list[dict[str, Any]]] = {}
+    for invoice in invoices:
+        invoices_by_dir.setdefault(Path(str(invoice["archive_path"])).parent.resolve(), []).append(invoice)
+    for directory, directory_invoices in invoices_by_dir.items():
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            if not path.is_file() or path.suffix.lower() not in RECEIPT_SUFFIXES or path.resolve() in invoice_paths:
+                continue
+            digest = sha256_file(path)
+            record = records.setdefault(digest, {})
+            record["archive_path"] = str(path)
+            record["source_path"] = str(path)
+            matched_invoice = directory_invoices[0] if len(directory_invoices) == 1 else next(
+                (
+                    invoice
+                    for invoice in directory_invoices
+                    if path.stem.startswith(Path(str(invoice["archive_path"])).stem + "_报销凭证")
+                ),
+                None,
+            )
+            if matched_invoice:
+                record["invoice_key"] = matched_invoice["record_key"]
+                record.setdefault("match_status", "待确认：人工放置，尚未校验")
+                record.setdefault("match_detail", "凭证文件已存在于发票目录")
+
+
+def match_receipts(root: Path, state: dict[str, Any], retry: bool = False) -> dict[str, Any]:
+    inbox = root / RECEIPT_INBOX_NAME
+    inbox.mkdir(parents=True, exist_ok=True)
+    inbox_invoices = archive_dropped_invoices(root, state)
+    invoices = rebuild_invoice_records(root, state)
+    discover_manually_placed_receipts(root, state, invoices)
+    sources = sorted(
+        path for path in inbox.iterdir() if path.is_file() and path.suffix.lower() in RECEIPT_SUFFIXES
+    )
+    if not sources:
+        return {
+            "status": "success",
+            "inbox": str(inbox),
+            "counts": {},
+            "items": [],
+            "inbox_invoices": inbox_invoices,
+            "inbox_invoice_summary": inbox_invoices.get("summary", inbox_invoice_summary([])),
+        }
+    records = state.setdefault("receipt_records", {})
+    prepared: list[tuple[Path, str, dict[str, Any]]] = []
+    ocr_texts: dict[str, str] = {}
+    items: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="receipt-xparse-") as temp_name:
+        temp_dir = Path(temp_name)
+        for source in sources:
+            digest = sha256_file(source)
+            ocr, cached = load_or_run_receipt_ocr(source, retry, temp_dir)
+            record = records.setdefault(digest, {})
+            record.update({"source_path": str(source), "original_filename": source.name, "ocr_cached": cached})
+            if ocr.get("status") != "success":
+                record.update(
+                    {
+                        "match_status": "识别失败",
+                        "match_detail": str(ocr.get("detail", "XParse 识别失败")),
+                        "processed_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
+                    }
+                )
+                items.append(
+                    _receipt_result("incomplete", source, record["match_detail"], str(ocr.get("code", "XPARSE_RUN_FAILED")))
+                )
+                continue
+            ocr_text = str(ocr.get("text", ""))
+            fields = extract_receipt_fields(ocr_text)
+            record["fields"] = fields
+            ocr_texts[digest] = ocr_text
+            prepared.append((source, digest, fields))
+
+    candidate_map: dict[str, list[dict[str, Any]]] = {}
+    failure_reasons: dict[str, list[str]] = {}
+    for source, digest, fields in prepared:
+        candidates: list[dict[str, Any]] = []
+        reasons: list[str] = []
+        for invoice in invoices:
+            matched, reason = receipt_candidate(invoice, fields, ocr_texts.get(digest, ""))
+            if matched:
+                candidates.append(invoice)
+            else:
+                reasons.append(reason)
+        candidate_map[digest] = candidates
+        failure_reasons[digest] = reasons
+
+    invoice_receipts: dict[str, list[tuple[Path, str, dict[str, Any]]]] = {}
+    for entry in prepared:
+        candidates = candidate_map[entry[1]]
+        if len(candidates) == 1:
+            invoice_receipts.setdefault(candidates[0]["record_key"], []).append(entry)
+
+    selected: dict[str, tuple[Path, str, dict[str, Any]]] = {}
+    duplicates: set[str] = set()
+    conflicts: set[str] = set()
+    for invoice_key, entries in invoice_receipts.items():
+        if len(entries) == 1:
+            selected[invoice_key] = entries[0]
+            continue
+        fingerprints = {receipt_transaction_fingerprint(entry[2]) for entry in entries}
+        if len(fingerprints) == 1:
+            choice = max(entries, key=lambda entry: (entry[0].stat().st_size, entry[0].name))
+            selected[invoice_key] = choice
+            duplicates.update(entry[1] for entry in entries if entry[1] != choice[1])
+        else:
+            conflicts.update(entry[1] for entry in entries)
+
+    invoices_by_key = {invoice["record_key"]: invoice for invoice in invoices}
+    for source, digest, fields in prepared:
+        record = records[digest]
+        candidates = candidate_map[digest]
+        now = dt.datetime.now().astimezone().replace(microsecond=0).isoformat()
+        if digest in duplicates:
+            record.update({"match_status": "重复凭证", "match_detail": "同一交易已有字段更完整的凭证", "processed_at": now})
+            items.append(_receipt_result("skipped", source, record["match_detail"], "RECEIPT_DUPLICATE"))
+            continue
+        if digest in conflicts or len(candidates) > 1:
+            record.update({"match_status": "匹配冲突", "match_detail": "存在多个同等可信候选", "processed_at": now})
+            items.append(_receipt_result("incomplete", source, record["match_detail"], "RECEIPT_MATCH_CONFLICT"))
+            continue
+        if not candidates:
+            reason_order = [
+                "存在退款、撤销或冲正", "交易未成功", "交易状态缺失", "收款方全称缺失",
+                "凭证包含多笔交易", "优惠差额无法解释", "优惠明细与差额不一致",
+                "支付金额缺失", "支付日期超出允许范围", "收款方与开票方不一致",
+                "优惠前订单金额与发票金额不一致", "实付金额与发票金额不一致",
+                "实付金额高于订单金额", "实付金额高于发票金额",
+                "发票已有报销凭证",
+            ]
+            all_reasons = failure_reasons.get(digest, [])
+            detail = next((reason for reason in reason_order if reason in all_reasons), "没有唯一匹配的有效发票")
+            record.update({"match_status": "未匹配", "match_detail": detail, "processed_at": now})
+            items.append(_receipt_result("incomplete", source, detail, "RECEIPT_NOT_MATCHED"))
+            continue
+        invoice = candidates[0]
+        if selected.get(invoice["record_key"], (None, "", {}))[1] != digest:
+            record.update({"match_status": "匹配冲突", "match_detail": "同一发票存在多份不同交易凭证", "processed_at": now})
+            items.append(_receipt_result("incomplete", source, record["match_detail"], "RECEIPT_MATCH_CONFLICT"))
+            continue
+        destination = receipt_destination(invoice, source, digest)
+        if destination.exists() and sha256_file(destination) == digest:
+            record.update({"match_status": "已匹配", "invoice_key": invoice["record_key"], "archive_path": str(destination)})
+            items.append(_receipt_result("skipped", source, "相同凭证已归档"))
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        record.update(
+            {
+                "match_status": "已匹配",
+                "match_detail": receipt_match_detail(
+                    fields,
+                    invoice["invoice_amount"],
+                    str(invoice["seller"]),
+                    ocr_texts.get(digest, ""),
+                ),
+                "invoice_key": invoice["record_key"],
+                "archive_path": str(destination),
+                "payment_date": str(fields.get("payment_time", ""))[:10],
+                "amount_difference": receipt_amount_difference(invoice["invoice_amount"], fields),
+                "reimbursement_amount": invoice["invoice_amount"],
+                "processed_at": now,
+            }
+        )
+        items.append(_receipt_result("success", destination, record["match_detail"]))
+    counts = {status: sum(item["status"] == status for item in items) for status in ("success", "skipped", "incomplete", "error")}
+    return {
+        "status": "success",
+        "inbox": str(inbox),
+        "counts": counts,
+        "items": items,
+        "inbox_invoices": inbox_invoices,
+        "inbox_invoice_summary": inbox_invoices.get("summary", inbox_invoice_summary([])),
+    }
+
+
 def archive_invoice(
     source: Path,
     suffix: str,
@@ -841,12 +1627,14 @@ def archive_invoice(
     state: dict[str, Any],
     text: str | None = None,
     provenance: dict[str, Any] | None = None,
+    extra_reasons: Iterable[str] | None = None,
 ) -> tuple[str, str, list[str]]:
     if text is None:
         text = pdf_text(source) if suffix == ".pdf" else ofd_text(source)
     fields = extract_invoice_fields(text)
     review_reasons = [key for key in ("date", "seller", "amount") if not fields[key]]
     review_reasons.extend(buyer_validation_issues(text))
+    review_reasons.extend(extra_reasons or [])
     date_label = fields["date"] or "未知日期"
     seller_label = safe_component(fields["seller"], "未知销售方")
     amount_label = fields["amount"] or "未知金额"
@@ -956,18 +1744,19 @@ def folder_entries(client: imaplib.IMAP4_SSL) -> list[tuple[str, str]]:
     if status != "OK":
         raise RuntimeError("无法读取邮箱文件夹列表")
     result: list[tuple[str, str]] = []
-    pattern = re.compile(rb"^\((.*?)\)\s+(?:\"[^\"]*\"|NIL)\s+(.+)$")
+    pattern = re.compile(rb"^\((.*?)\)\s+(\"[^\"]*\"|NIL)\s+(.+)$")
     for line in lines or []:
         if not isinstance(line, bytes) or not (match := pattern.match(line)):
             continue
         flags = set(match.group(1).split())
-        raw_name = match.group(2).strip()
+        delimiter_raw = match.group(2)
+        delimiter = "" if delimiter_raw == b"NIL" else delimiter_raw.strip(b'"').decode("ascii", errors="replace")
+        raw_name = match.group(3).strip()
         if raw_name.startswith(b'"') and raw_name.endswith(b'"'):
             raw_name = raw_name[1:-1].replace(b'\\"', b'"').replace(b"\\\\", b"\\")
         wire_name = raw_name.decode("ascii", errors="replace")
         display_name = decode_modified_utf7(wire_name)
-        lowered = display_name.lower()
-        if flags & EXCLUDED_FLAGS or any(token in lowered for token in EXCLUDED_NAMES):
+        if folder_is_excluded(display_name, flags, delimiter):
             continue
         result.append((wire_name, display_name))
     if "INBOX" not in {wire.upper() for wire, _display in result}:
@@ -982,9 +1771,9 @@ def parse_uid_search(status: str, values: list[bytes | None]) -> set[int]:
 
 
 def search_date_uids(client: imaplib.IMAP4_SSL, from_date: dt.date, to_date: dt.date | None) -> list[int]:
-    criteria: list[str] = ["SINCE", from_date.strftime("%d-%b-%Y")]
+    criteria: list[str] = ["SINCE", imap_date(from_date)]
     if to_date:
-        criteria.extend(["BEFORE", (to_date + dt.timedelta(days=1)).strftime("%d-%b-%Y")])
+        criteria.extend(["BEFORE", imap_date(to_date + dt.timedelta(days=1))])
     status, values = client.uid("search", None, *criteria)
     return sorted(parse_uid_search(status, values))
 
@@ -1062,6 +1851,7 @@ def process_file(
     provenance: dict[str, Any] | None = None,
     seen_pdf_keys: set[str] | None = None,
     trusted_invoice_source: bool = False,
+    inbox_drop: bool = False,
 ) -> list[tuple[str, str, str]]:
     if seen_pdf_keys is None:
         seen_pdf_keys = set()
@@ -1091,28 +1881,39 @@ def process_file(
                     child_provenance,
                     seen_pdf_keys,
                     trusted_invoice_source,
+                    inbox_drop,
                 )
             )
         return results
     extraction_warning = ""
+    extra_reasons: list[str] = []
     try:
         text = pdf_text(path) if suffix == ".pdf" else ofd_text(path)
     except Exception as exc:
-        if not trusted_invoice_source:
+        if not trusted_invoice_source and not inbox_drop:
             return [("incomplete", hinted_name, str(exc))]
         text = ""
-        extraction_warning = f"；可信发票平台文件已保留，但文字提取失败：{error_code(exc, 'PDF_TEXT_EXTRACTION_FAILED')}"
+        extra_reasons.append("文字提取失败")
+        extraction_warning = f"；文字提取失败：{error_code(exc, 'PDF_TEXT_EXTRACTION_FAILED')}"
     trusted_context = str((provenance or {}).get("subject", "")) if trusted_invoice_source else ""
     invoice_text = f"{text}\n{trusted_context}".strip()
-    if not is_invoice_document(invoice_text, hinted_name) and not trusted_invoice_source:
-        return [("skipped", hinted_name, "附件内容不是可识别的发票，未归档")]
+    recognized = is_invoice_document(invoice_text, hinted_name) or trusted_invoice_source
+    if not recognized:
+        if inbox_drop and suffix == ".ofd":
+            extra_reasons.append("文字提取失败" if not invoice_text else "未能识别为发票")
+        elif inbox_drop and not invoice_text:
+            extra_reasons.append("文字提取失败")
+        else:
+            return [("skipped", hinted_name, "附件内容不是可识别的发票，未归档")]
     invoice_key = invoice_identity(invoice_text, hinted_name)
     if suffix == ".ofd" and invoice_key:
         existing_pdf = recorded_format_path(state, invoice_key, ".pdf")
         if invoice_key in seen_pdf_keys or existing_pdf is not None:
             detail = str(existing_pdf) if existing_pdf is not None else "本批次已处理同一发票的 PDF"
             return [("skipped", hinted_name, f"同一发票已有 PDF，未保留 OFD；{detail}")]
-    status, destination, review_reasons = archive_invoice(path, suffix, root, state, invoice_text, provenance)
+    status, destination, review_reasons = archive_invoice(
+        path, suffix, root, state, invoice_text, provenance, extra_reasons
+    )
     removed_ofd = ""
     if invoice_key:
         formats = state.setdefault("invoice_formats", {}).setdefault(invoice_key, {})
@@ -1349,6 +2150,24 @@ def run_account_once(
             initialize_from_range = False
             try:
                 if start_from_now:
+                    if folder_state.get("initialized", False):
+                        emit_progress(
+                            "folder_start_from_now_skipped",
+                            account=email,
+                            folder=display_name,
+                            last_uid=last_uid,
+                        )
+                        output.append(
+                            report_item(
+                                "skipped",
+                                f"文件夹:{display_name}",
+                                "",
+                                email,
+                                "已初始化文件夹未因 --start-from-now 重置游标或待重试队列",
+                                "START_FROM_NOW_SKIPPED_INITIALIZED",
+                            )
+                        )
+                        continue
                     checkpoint = current_last_uid(client)
                     folder_state.update(
                         {"uidvalidity": uidvalidity, "initialized": True, "last_uid": checkpoint, "pending_uids": []}
@@ -1359,8 +2178,9 @@ def run_account_once(
                     continue
                 if explicit_range:
                     uids = search_date_uids(client, from_date, to_date)
-                    # 指定日期范围是一次独立扫描：不得把任何历史待处理 UID 混入本次候选。
-                    pending: set[int] = set()
+                    # 本次只处理日期查询结果，不把历史 pending 混入候选。
+                    # 历史 pending 先原样保留：范围内成功的会 discard，失败的会加回。
+                    pending = set(previous_pending)
                     if folder_state.get("initialized", False):
                         checkpoint = last_uid
                     else:
@@ -1626,8 +2446,19 @@ def cmd_configure_ui(args: argparse.Namespace) -> int:
         server.configuration_complete = False  # type: ignore[attr-defined]
         server.timeout = 1
         url = f"http://127.0.0.1:{server.server_port}/?token={token}"
-        print(json.dumps({"status": "waiting_for_user", "url": url, "email": email}, ensure_ascii=False), flush=True)
-        webbrowser.open(url)
+        opened = webbrowser.open(url)
+        if not opened:
+            raise SkillError(
+                "CONFIGURATION_BROWSER_UNAVAILABLE",
+                "无法打开本机浏览器配置页；请改用交互式 configure",
+            )
+        print(
+            json.dumps(
+                {"status": "waiting_for_user", "email": email, "bind": "127.0.0.1", "browser_opened": True},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         deadline = time.monotonic() + 600
         while not server.configuration_complete and time.monotonic() < deadline:  # type: ignore[attr-defined]
             server.handle_request()
@@ -1644,6 +2475,8 @@ def cmd_accounts(_args: argparse.Namespace) -> int:
             {
                 "invoice_root": config["invoice_root"],
                 "trusted_domains": config["trusted_domains"],
+                "required_buyer_name": config.get("required_buyer_name", REQUIRED_BUYER_NAME),
+                "required_buyer_tax_id": config.get("required_buyer_tax_id", REQUIRED_BUYER_TAX_ID),
                 "accounts": config["accounts"],
             },
             ensure_ascii=False,
@@ -1662,11 +2495,24 @@ def cmd_preflight(_args: argparse.Namespace) -> int:
     ca_path = Path(certifi.where())
     try:
         node_path, artifact_path = find_excel_runtime()
-        excel_runtime = {"available": True, "node": str(node_path), "artifact_tool": str(artifact_path)}
+        excel_runtime = {
+            "available": True,
+            "backend": "artifact-tool",
+            "node": str(node_path),
+            "artifact_tool": str(artifact_path),
+        }
     except SkillError as exc:
-        excel_runtime = {"available": False, "code": exc.code, "detail": str(exc)}
+        if openpyxl_available():
+            excel_runtime = {"available": True, "backend": "openpyxl"}
+        else:
+            excel_runtime = {"available": False, "code": exc.code, "detail": str(exc)}
+    try:
+        xparse_path = find_xparse_cli()
+        xparse_cli = {"available": True, "path": str(xparse_path), "mode": "free"}
+    except SkillError as exc:
+        xparse_cli = {"available": False, "code": exc.code, "detail": str(exc)}
     result = {
-        "ok": sys.version_info >= (3, 10) and ca_path.is_file() and excel_runtime["available"],
+        "ok": sys.version_info >= (3, 10) and ca_path.is_file(),
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "ca_bundle": str(ca_path),
@@ -1674,6 +2520,7 @@ def cmd_preflight(_args: argparse.Namespace) -> int:
         "keyring_backend": type(keyring.get_keyring()).__name__,
         "dependencies": {"pypdf": pypdf.__version__, "pdfplumber": pdfplumber.__version__},
         "excel_runtime": excel_runtime,
+        "receipt_ocr": xparse_cli,
         "data_dir": str(app_data_dir()),
         "invoice_root": load_config()["invoice_root"],
     }
@@ -1719,6 +2566,23 @@ def cmd_set_root(args: argparse.Namespace) -> int:
     config["invoice_root"] = str(root)
     atomic_json_write(config_path(), config)
     print(f"默认发票目录已设置为：{root}")
+    return 0
+
+
+def cmd_set_buyer(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        raise SkillError("CONFIRMATION_REQUIRED", "修改购买方校验需要用户确认后添加 --confirm")
+    name = str(args.name).strip()
+    tax_id = re.sub(r"[^0-9A-Z]", "", str(args.tax_id).upper())
+    if len(name) < 2:
+        raise ValueError("购买方名称至少 2 个字符")
+    if not re.fullmatch(r"[0-9A-Z]{15,20}", tax_id):
+        raise ValueError("购买方纳税人识别号必须是 15 到 20 位数字或大写字母")
+    config = load_config()
+    config["required_buyer_name"] = name
+    config["required_buyer_tax_id"] = tax_id
+    atomic_json_write(config_path(), config)
+    print(json.dumps({"required_buyer_name": name, "required_buyer_tax_id": tax_id}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1776,7 +2640,7 @@ def scan_metadata(
     if start_from_now:
         return {
             "mode": "incremental_from_now_initialized",
-            "description": "已记录当前 UID；本次不读取历史邮件，后续只处理新邮件",
+            "description": "仅初始化尚未建立游标的文件夹；已初始化文件夹的 last_uid 与 pending_uids 保持不变",
         }
     if explicit_range:
         return {
@@ -1785,7 +2649,7 @@ def scan_metadata(
             "to": str(to_date),
             "last_uid_advanced": initializing,
             "pending_uids_updated": True,
-            "pending_scope": "current_date_range_only",
+            "pending_scope": "merge_outside_range_with_current_failures",
         }
     return {
         "mode": "uid_incremental",
@@ -1796,12 +2660,26 @@ def scan_metadata(
 def rebuild_file_index(root: Path, state: dict[str, Any]) -> None:
     files = state.setdefault("files", {})
     previously_recorded = {Path(value) for value in files.values()}
+    receipt_paths = {
+        Path(value).resolve()
+        for record in state.setdefault("receipt_records", {}).values()
+        for value in (record.get("source_path"), record.get("archive_path"))
+        if value and Path(value).exists()
+    }
     if not root.exists():
         return
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() in {".pdf", ".ofd"}:
+            try:
+                relative_parts = path.resolve().relative_to(root.resolve()).parts
+            except (OSError, ValueError):
+                continue
+            if RECEIPT_INBOX_NAME in relative_parts or path.resolve() in receipt_paths or "_报销凭证" in path.stem:
+                continue
             digest = sha256_file(path)
             recorded = files.get(digest)
+            if not recorded and path.suffix.lower() == ".pdf" and not archived_filename_fields(path.name)["date"]:
+                continue
             if not recorded or not Path(recorded).exists():
                 files[digest] = str(path)
     if state.get("invoice_format_index_built"):
@@ -1907,11 +2785,44 @@ def rebuild_invoice_records(root: Path, state: dict[str, Any]) -> list[dict[str,
             "downloaded_at": downloaded_at,
             "validation_status": invoice_validation_status(review_reasons),
             "archive_path": str(path),
+            "has_receipt": "否",
+            "receipt_path": "",
+            "receipt_name": "",
+            "receipt_status": "未匹配",
+            "receipt_detail": "尚未找到对应报销凭证",
+            "receipt_payment_date": "",
+            "receipt_amount_difference": "",
         }
         existing = current.get(record_key)
         if existing and Path(existing["archive_path"]).suffix.lower() == ".pdf":
             continue
         current[record_key] = record
+    for receipt in state.setdefault("receipt_records", {}).values():
+        invoice_key = str(receipt.get("invoice_key", ""))
+        invoice = current.get(invoice_key)
+        receipt_value = receipt.get("archive_path")
+        if not invoice or not receipt_value:
+            continue
+        receipt_path = Path(str(receipt_value))
+        if not receipt_path.exists():
+            continue
+        try:
+            relative = receipt_path.resolve().relative_to(resolved_root)
+        except (OSError, ValueError):
+            continue
+        if RECEIPT_INBOX_NAME in relative.parts:
+            continue
+        invoice.update(
+            {
+                "has_receipt": "是",
+                "receipt_path": relative.as_posix(),
+                "receipt_name": receipt_path.name,
+                "receipt_status": receipt.get("match_status", "待确认"),
+                "receipt_detail": receipt.get("match_detail", "凭证文件已存在"),
+                "receipt_payment_date": receipt.get("payment_date", ""),
+                "receipt_amount_difference": receipt.get("amount_difference", ""),
+            }
+        )
     state["invoice_records"] = current
     return list(current.values())
 
@@ -1942,9 +2853,29 @@ def find_excel_runtime() -> tuple[Path, Path]:
     if not node or not artifact:
         raise SkillError(
             "EXCEL_RUNTIME_MISSING",
-            "未找到 Codex 电子表格运行时；发票已归档，Excel 将在运行时恢复后重试同步",
+            "未找到 Codex 电子表格运行时；将尝试使用 openpyxl",
         )
     return node, artifact
+
+
+def openpyxl_available() -> bool:
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def load_invoice_register_module() -> Any:
+    import importlib.util
+
+    path = Path(__file__).with_name("invoice_register.py")
+    spec = importlib.util.spec_from_file_location("invoice_register", path)
+    if spec is None or spec.loader is None:
+        raise SkillError("EXCEL_RUNTIME_MISSING", "未找到 openpyxl 登记表模块")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def sync_invoice_workbook(
@@ -1954,51 +2885,217 @@ def sync_invoice_workbook(
 ) -> dict[str, Any]:
     """生成或更新发票登记表；现有人工字段由工作簿中的记录键保留。"""
     records = rebuild_invoice_records(root, state)
-    node, artifact = find_excel_runtime()
-    helper = Path(__file__).with_name("invoice_excel.mjs")
     output = root / INVOICE_REGISTER_FILENAME
-    payload = {
-        "generated_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
-        "records": records,
-    }
-    with tempfile.TemporaryDirectory(prefix="invoice-register-") as temp_name:
-        payload_path = Path(temp_name) / "records.json"
-        payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        command = [str(node), str(helper), str(payload_path), str(output)]
-        if preview_path:
-            command.append(str(preview_path))
-        environment = os.environ.copy()
-        environment["INVOICE_ARTIFACT_TOOL_ENTRY"] = str(artifact)
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-                env=environment,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SkillError("EXCEL_SYNC_FAILED", f"发票登记表同步失败：{type(exc).__name__}") from exc
-    if completed.returncode != 0:
-        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "未知错误"
-        raise SkillError("EXCEL_SYNC_FAILED", f"发票登记表同步失败：{detail[:500]}")
-    return {"status": "success", "path": str(output), "rows": len(records)}
+    artifact_error: BaseException | None = None
+    try:
+        node, artifact = find_excel_runtime()
+        helper = Path(__file__).with_name("invoice_excel.mjs")
+        payload = {
+            "generated_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
+            "records": records,
+        }
+        with tempfile.TemporaryDirectory(prefix="invoice-register-") as temp_name:
+            payload_path = Path(temp_name) / "records.json"
+            payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            command = [str(node), str(helper), str(payload_path), str(output)]
+            if preview_path:
+                command.append(str(preview_path))
+            environment = os.environ.copy()
+            environment["INVOICE_ARTIFACT_TOOL_ENTRY"] = str(artifact)
+            last_subprocess_error: BaseException | None = None
+            for attempt in range(3):
+                try:
+                    completed = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=120,
+                        env=environment,
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    last_subprocess_error = exc
+                    time.sleep(2**attempt)
+                    continue
+                if completed.returncode == 0:
+                    return {"status": "success", "path": str(output), "rows": len(records), "backend": "artifact-tool"}
+                error_text = completed.stderr + completed.stdout
+                if attempt < 2 and re.search(r"EPERM|EBUSY|EACCES|locked|being used", error_text, re.I):
+                    time.sleep(2**attempt)
+                    continue
+                error_lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
+                detail = next(
+                    (line for line in reversed(error_lines) if not re.match(r"^(Node\.js v|at |\^+$)", line)),
+                    "未知错误",
+                )
+                artifact_error = SkillError("EXCEL_SYNC_FAILED", f"发票登记表同步失败：{detail[:500]}")
+                break
+            else:
+                artifact_error = SkillError(
+                    "EXCEL_SYNC_FAILED",
+                    f"发票登记表同步失败：{type(last_subprocess_error).__name__ if last_subprocess_error else '未知错误'}",
+                )
+    except SkillError as exc:
+        if exc.code != "EXCEL_RUNTIME_MISSING":
+            raise
+        artifact_error = exc
+    if not openpyxl_available():
+        raise SkillError(
+            "EXCEL_RUNTIME_MISSING",
+            "未找到 Excel 运行时（Codex artifact-tool 或 openpyxl）；发票已归档，安装依赖后执行 sync-excel",
+        ) from artifact_error
+    if preview_path:
+        emit_progress("excel_preview_skipped", reason="openpyxl_backend")
+    try:
+        result = load_invoice_register_module().write_invoice_workbook(output, records)
+    except Exception as exc:  # noqa: BLE001 - 保护人工字段
+        raise SkillError("EXCEL_SYNC_FAILED", f"发票登记表同步失败：{exc}") from (artifact_error or exc)
+    if artifact_error:
+        result = dict(result)
+        result["fallback"] = "openpyxl"
+        result["artifact_error"] = error_code(artifact_error, "EXCEL_SYNC_FAILED")
+    return result
 
 
 def cmd_sync_excel(args: argparse.Namespace) -> int:
     config = load_config()
+    apply_buyer_from_config(config)
     root = Path(config["invoice_root"]).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     state = load_state()
     rebuild_file_index(root, state)
     rebuild_invoice_identity_index(root, state)
+    discover_manually_placed_receipts(root, state, rebuild_invoice_records(root, state))
     preview_path = Path(args.preview).expanduser().resolve() if args.preview else None
     result = sync_invoice_workbook(root, state, preview_path)
     atomic_json_write(state_path(), state)
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_match_receipts(args: argparse.Namespace) -> int:
+    config = load_config()
+    apply_buyer_from_config(config)
+    root = Path(config["invoice_root"]).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    state = load_state()
+    with exclusive_run_lock():
+        rebuild_file_index(root, state)
+        rebuild_invoice_identity_index(root, state)
+        result = match_receipts(root, state, bool(args.retry))
+        atomic_json_write(state_path(), state)
+    try:
+        invoice_register = sync_invoice_workbook(root, state)
+    except Exception as exc:
+        rebuild_invoice_records(root, state)
+        invoice_register = {
+            "status": "error",
+            "code": error_code(exc, "EXCEL_SYNC_FAILED"),
+            "path": str(root / INVOICE_REGISTER_FILENAME),
+            "detail": str(exc),
+        }
+    atomic_json_write(state_path(), state)
+    result["invoice_register"] = invoice_register
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    counts = result.get("counts", {})
+    return 2 if invoice_register["status"] == "error" else (1 if counts.get("incomplete") else 0)
+
+
+def _invoice_by_number(root: Path, state: dict[str, Any], invoice_number: str) -> dict[str, Any]:
+    matches = [
+        record for record in rebuild_invoice_records(root, state)
+        if str(record.get("invoice_number", "")) == invoice_number.strip()
+    ]
+    if len(matches) != 1:
+        raise SkillError("INVOICE_NOT_UNIQUE", "未找到唯一的目标发票号码")
+    return matches[0]
+
+
+def cmd_assign_receipt(args: argparse.Namespace) -> int:
+    config = load_config()
+    apply_buyer_from_config(config)
+    root = Path(config["invoice_root"]).expanduser().resolve()
+    source = Path(args.receipt).expanduser().resolve()
+    try:
+        source.relative_to(root)
+    except ValueError as exc:
+        raise SkillError("RECEIPT_OUTSIDE_ROOT", "人工指定的凭证必须位于发票根目录内") from exc
+    if not source.is_file() or source.suffix.lower() not in RECEIPT_SUFFIXES:
+        raise SkillError("RECEIPT_NOT_FOUND", "未找到可支持的报销凭证文件")
+    state = load_state()
+    with exclusive_run_lock():
+        rebuild_file_index(root, state)
+        invoice = _invoice_by_number(root, state, args.invoice_number)
+        if invoice.get("has_receipt") == "是":
+            raise SkillError("INVOICE_ALREADY_HAS_RECEIPT", "目标发票已经存在报销凭证")
+        digest = sha256_file(source)
+        destination = receipt_destination(invoice, source, digest)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source != destination:
+            shutil.move(str(source), str(destination))
+        previous = state.setdefault("receipt_records", {}).setdefault(digest, {})
+        fields = previous.get("fields", {})
+        previous.update(
+            {
+                "source_path": str(source),
+                "archive_path": str(destination),
+                "invoice_key": invoice["record_key"],
+                "match_status": "人工匹配",
+                "match_detail": "用户通过 Agent 人工确认",
+                "payment_date": str(fields.get("payment_time", ""))[:10],
+                "reimbursement_amount": invoice["invoice_amount"],
+                "processed_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
+            }
+        )
+        atomic_json_write(state_path(), state)
+    result = sync_invoice_workbook(root, state)
+    atomic_json_write(state_path(), state)
+    print(json.dumps({"status": "success", "receipt": str(destination), "invoice_register": result}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_unmatch_receipt(args: argparse.Namespace) -> int:
+    config = load_config()
+    apply_buyer_from_config(config)
+    root = Path(config["invoice_root"]).expanduser().resolve()
+    state = load_state()
+    invoice = _invoice_by_number(root, state, args.invoice_number)
+    matches = [
+        (digest, record) for digest, record in state.setdefault("receipt_records", {}).items()
+        if record.get("invoice_key") == invoice["record_key"] and record.get("archive_path")
+        and Path(str(record["archive_path"])).exists()
+    ]
+    if len(matches) != 1:
+        raise SkillError("RECEIPT_NOT_UNIQUE", "目标发票没有唯一的已归档凭证")
+    digest, record = matches[0]
+    source = Path(str(record["archive_path"]))
+    inbox = root / RECEIPT_INBOX_NAME
+    inbox.mkdir(parents=True, exist_ok=True)
+    original_name = str(record.get("original_filename") or source.name)
+    destination = inbox / safe_component(Path(original_name).stem, "报销凭证", 100)
+    destination = destination.with_suffix(Path(original_name).suffix.lower() or source.suffix.lower())
+    if destination.exists() and sha256_file(destination) != digest:
+        destination = destination.with_name(f"{destination.stem}_{digest[:8]}{destination.suffix}")
+    with exclusive_run_lock():
+        if source != destination:
+            shutil.move(str(source), str(destination))
+        record.update(
+            {
+                "source_path": str(destination),
+                "archive_path": "",
+                "invoice_key": "",
+                "match_status": "已解除",
+                "match_detail": "用户通过 Agent 解除关联",
+                "payment_date": "",
+                "processed_at": dt.datetime.now().astimezone().replace(microsecond=0).isoformat(),
+            }
+        )
+        atomic_json_write(state_path(), state)
+    result = sync_invoice_workbook(root, state)
+    atomic_json_write(state_path(), state)
+    print(json.dumps({"status": "success", "receipt": str(destination), "invoice_register": result}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2114,6 +3211,7 @@ def cmd_repair_state(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     config = load_config()
+    apply_buyer_from_config(config)
     accounts = [item for item in config.get("accounts", []) if item.get("enabled", True)]
     if args.account:
         accounts = [item for item in accounts if item.get("email", "").lower() == args.account.lower()]
@@ -2174,6 +3272,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
             atomic_json_write(state_path(), state)
     try:
+        receipt_matching = match_receipts(root, state)
+    except Exception as exc:
+        receipt_matching = {
+            "status": "error",
+            "code": error_code(exc, "RECEIPT_MATCH_FAILED"),
+            "inbox": str(root / RECEIPT_INBOX_NAME),
+            "detail": str(exc),
+            "counts": {"error": 1},
+            "items": [],
+        }
+    try:
         invoice_register = sync_invoice_workbook(root, state)
     except Exception as exc:
         rebuild_invoice_records(root, state)
@@ -2191,19 +3300,28 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "invoice_root": str(root),
                 "scan": scan_metadata(explicit_range, from_date, to_date, start_from_now, bool(unconfirmed)),
                 "counts": counts,
+                "inbox_invoice_summary": receipt_matching.get("inbox_invoice_summary", inbox_invoice_summary([])),
                 "invoice_register": invoice_register,
+                "receipt_matching": receipt_matching,
                 "items": results,
             },
             ensure_ascii=False,
             indent=2,
         )
     )
-    return 2 if counts["error"] or invoice_register["status"] == "error" else (1 if counts["incomplete"] else 0)
+    receipt_counts = receipt_matching.get("counts", {})
+    return 2 if counts["error"] or invoice_register["status"] == "error" else (
+        1 if counts["incomplete"] or receipt_counts.get("incomplete") or receipt_counts.get("error") else 0
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="从 163/QQ 邮箱下载并整理电子发票")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    public_commands = (
+        "configure,configure-ui,accounts,preflight,set-root,set-buyer,trusted-domains,trust-domain,"
+        "untrust-domain,enable,disable,remove-account,repair-state,sync-excel,match-receipts,run"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar=f"{{{public_commands}}}")
 
     configure = subparsers.add_parser("configure", help="添加或更新邮箱账号")
     configure.add_argument("--provider", choices=sorted(PROVIDERS), required=True)
@@ -2225,6 +3343,12 @@ def build_parser() -> argparse.ArgumentParser:
     set_root.add_argument("path")
     set_root.add_argument("--confirm", action="store_true", help="确认修改目录")
     set_root.set_defaults(handler=cmd_set_root)
+
+    set_buyer = subparsers.add_parser("set-buyer", help="设置普通发票购买方名称和税号")
+    set_buyer.add_argument("--name", required=True, help="购买方名称")
+    set_buyer.add_argument("--tax-id", required=True, help="购买方纳税人识别号")
+    set_buyer.add_argument("--confirm", action="store_true", help="确认修改购买方校验")
+    set_buyer.set_defaults(handler=cmd_set_buyer)
 
     trusted_domains = subparsers.add_parser("trusted-domains", help="查看可信下载域名")
     trusted_domains.set_defaults(handler=cmd_trusted_domains)
@@ -2252,6 +3376,27 @@ def build_parser() -> argparse.ArgumentParser:
     sync_excel = subparsers.add_parser("sync-excel", help="从已归档发票补录或更新发票登记表")
     sync_excel.add_argument("--preview", help="可选：同时把登记表渲染为指定 PNG，供检查使用")
     sync_excel.set_defaults(handler=cmd_sync_excel)
+
+    match_receipts_parser = subparsers.add_parser(
+        "match-receipts", help="使用 TextIn XParse 免费模式识别并匹配报销凭证"
+    )
+    match_receipts_parser.add_argument(
+        "--retry", action="store_true", help="忽略本地识别缓存，重新上传投放目录中的凭证"
+    )
+    match_receipts_parser.set_defaults(handler=cmd_match_receipts)
+
+    assign_receipt = subparsers.add_parser("assign-receipt", help=argparse.SUPPRESS)
+    assign_receipt.add_argument("--receipt", required=True)
+    assign_receipt.add_argument("--invoice-number", required=True)
+    assign_receipt.set_defaults(handler=cmd_assign_receipt)
+
+    unmatch_receipt = subparsers.add_parser("unmatch-receipt", help=argparse.SUPPRESS)
+    unmatch_receipt.add_argument("--invoice-number", required=True)
+    unmatch_receipt.set_defaults(handler=cmd_unmatch_receipt)
+    subparsers._choices_actions = [
+        action for action in subparsers._choices_actions
+        if action.dest not in {"assign-receipt", "unmatch-receipt"}
+    ]
 
     run = subparsers.add_parser("run", help="执行一次扫描、下载和归档")
     run.add_argument("--account", help="只运行指定邮箱")
